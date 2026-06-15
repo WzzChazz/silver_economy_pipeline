@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.env.*
+! .env.example
+output/
+data/
+storage/
+assets/
+*.mp3
+*.mp4
+*.wav
+*.png
+*.jpg
+*.html
