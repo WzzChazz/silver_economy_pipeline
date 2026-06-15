@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 video_engine.py  —  视频合成引擎 V3
 重构要点：

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 database.py  —  故事库核心数据层
 重构要点：

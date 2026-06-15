@@ -97,8 +97,8 @@ def health_check() -> dict:
     from src.core import database
     database.init_db()
     stats = database.get_stats()
-    ready = stats["ready"]
-    total = stats["total"]
+    ready = stats["ready_stories"]
+    total = stats["total_stories"]
 
     status = "ok"
     warnings = []

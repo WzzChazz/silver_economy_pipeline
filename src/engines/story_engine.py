@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 story_engine.py  —  故事评分与入库引擎
 重构要点：

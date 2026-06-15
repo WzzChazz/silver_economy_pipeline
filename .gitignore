@@ -14,3 +14,5 @@ assets/
 *.png
 *.jpg
 *.html
+venv/
+venv_f5/

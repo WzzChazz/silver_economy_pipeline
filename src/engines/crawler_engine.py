@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 crawler_engine.py  —  多渠道故事采集引擎
 重构要点：

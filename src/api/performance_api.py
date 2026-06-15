@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 performance_api.py  —  视频号数据回传与飞轮驱动
 功能：
