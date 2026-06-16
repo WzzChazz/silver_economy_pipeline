@@ -9,7 +9,13 @@ openai-whisper>=20231117        # 字幕对齐（small 模型）
 imageio-ffmpeg>=0.4.9
 
 # TTS
-edge-tts>=6.1.10
+edge-tts>=6.1.10                # 默认后端（机器音，开箱即用）
+# F5-TTS 真人克隆音（可选，较重）—— 强烈建议起号后启用，产出更自然：
+#   pip install f5-tts torch torchaudio
+#   然后 .env 设 TTS_BACKEND=f5，并在 assets/voices/ 放 female/male 参考音
+# f5-tts
+# torch
+# torchaudio
 
 # 浏览器自动化
 playwright>=1.44.0

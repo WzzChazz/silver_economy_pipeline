@@ -48,12 +48,13 @@ _SCORE_PROMPT = """
 原始素材：
 {story}
 
-评分维度说明（每项 0-20 分）：
-1. score_pain（情绪/转发驱动力）：情绪是否强到让人“想转给家人”（父母爱情、年代回忆、孝心触动）。
-2. score_truth（真实性）：细节是否具体真实，有生活气息，像真人经历。
-3. score_resonance（共鸣面）：多少比例的中老年/其子女会“说的就是我家”。
-4. score_freshness（新鲜度/非套路）：是否区别于“正能量鸡汤”，有具体年代/物件锚点。
-5. score_rewrite（改写潜力）：能否提炼金句，改写成 30-45 秒短视频爆款。
+评分维度说明（每项 0-20 分）。本赛道核心是「照片唤起度」与「转发驱动力」——
+能让用户对号入座、想起自家一张具体老照片，并想转给家人的素材，才有起量 + 引向纪念视频的价值：
+1. score_pain（转发驱动力）★：看完想不想立刻转给爸妈/子女？转发动机越强越高分。
+2. score_truth（年代真实质感）：是否有具体年代生活气息（物件、习俗、场景），不空泛。
+3. score_resonance（照片唤起度）★：能让多少人“想起我家也有这样一张照片/这个物件”。这是最关键维度。
+4. score_freshness（年代锚点具体度）：有没有具体的年份/物件/场景锚点（粮票、的确良、二八自行车、老挂历），而非泛泛抒情。
+5. score_rewrite（短视频改写潜力）：能否提炼成 15-25 秒、第二人称唤起式的短口播。
 
 【限流红线·必须严判】若素材主体是 疾病/医院/看病/卖惨/独居孤独/老伴去世 等负向限流方向，
 则 score_pain 与 score_freshness 直接给 ≤8 分（这类无转发基因、易限流，不要它）。
@@ -87,7 +88,7 @@ _SCORE_PROMPT = """
 
 
 # ---------- 核心评估入口 ----------
-def evaluate_story(raw_story: str, source: str = "unknown") -> Optional[dict]:
+def evaluate_story(raw_story: str, source: str = "unknown", force_theme: str = None) -> Optional[dict]:
     """
     评估一段原始故事，高分自动入库。
     返回评分结果 dict，入库失败或低分返回 None。
@@ -110,7 +111,9 @@ def evaluate_story(raw_story: str, source: str = "unknown") -> Optional[dict]:
         "rewrite":   int(result.get("score_rewrite",   0)),
     }
     total = sum(scores.values())
-    theme   = result.get("theme",   "life")
+    # 生成路径锁定主题：唤起型素材（老物件/年代感）会被评分 LLM 几乎全判成"年代记忆"，
+    # 导致按账号主题拉取时其它主题没货，故 generate 传入的 force_theme 优先。
+    theme   = force_theme or result.get("theme",   "life")
     narrative_type = result.get("narrative_type", "默认型")
     emotion = result.get("emotion", "未知")
     scene   = result.get("scene",   "general")
@@ -123,8 +126,9 @@ def evaluate_story(raw_story: str, source: str = "unknown") -> Optional[dict]:
         f"| {theme} / {narrative_type} / {emotion}"
     )
 
-    # 入库阈值：总分 ≥ 75，且痛点 + 真实性均 ≥ 13（避免空洞高分）
-    if total >= 75 and scores["pain"] >= 13 and scores["truth"] >= 13:
+    # 入库阈值：总分 ≥ 75，且【转发驱动力 + 照片唤起度】均 ≥ 13
+    # （换轴：这两维才是本赛道的命门，避免"真实但没人想转、没人对号入座"的空洞高分入库）
+    if total >= 75 and scores["pain"] >= 13 and scores["resonance"] >= 13:
         database.init_db()
         inserted = database.insert_story(
             theme=theme,
@@ -159,6 +163,71 @@ def batch_evaluate(stories: list[str], source: str = "unknown") -> list[dict]:
             results.append(r)
         time.sleep(1.5)  # 保护 API 限速
     return results
+
+
+# ---------- 唤起型素材生成（替代纯采集，零侵权 + 强对号入座）----------
+# 主题 → 年代物件/场景锚点池，喂给 LLM 提高多样性，避免每条都"黑白结婚照"
+_THEME_ANCHORS = {
+    "父母爱情": ["的确良衬衫", "二八自行车", "黑白结婚照", "搪瓷缸", "钢笔与情书", "粮票"],
+    "金婚岁月": ["一碗热汤面", "起夜倒的水", "缝了又补的毛衣", "老花镜", "并排的旧藤椅"],
+    "年代记忆": ["老挂历", "粮票布票", "黑白电视机", "收音机", "煤油灯", "搪瓷脸盆"],
+    "儿女孝心": ["小时候的全家福", "妈妈做的第一件衣服", "爸爸扛在肩上的背影", "老相册", "压岁钱的红纸包"],
+}
+
+_GENERATE_PROMPT = """
+你是「老照片·家庭回忆」赛道的资深选题策划。请围绕主题【{theme}】生成 {n} 条【唤起型素材】。
+
+【什么是唤起型素材——最重要】
+不是讲某个具体个人的独特故事，而是写【一代人的共同经历】，让千万中老年用户看完都觉得"说的就是我家"。
+每条必须锚定一件【那个年代的具体物件/场景】（可参考：{anchors}，也可自选同年代物件），
+并指向一张【用户家里大概率真的有】的老照片或画面，强到让人想翻出自家相册。
+
+【硬性要求】
+1. 每条 120~220 字，平实、有具体年代细节，不要金句堆砌、不要抒情口号。
+2. 正向温暖：怀念 / 相守 / 惊喜 / 陪伴 / 年代质感。
+3. 【绝对红线】禁止出现 去世/走了/病了/住院/卖惨/独居孤独/"最后一面" 等任何负向或死亡字眼——这类会限流、压转发。
+4. {n} 条之间物件/角度要错开，不要雷同。
+
+严格输出 JSON（不含多余文字）：
+{{
+    "stories": ["第一条素材...", "第二条素材...", ...]
+}}
+"""
+
+
+def generate_evocative_stories(
+    themes: list[str] = None,
+    n_per_theme: int = 3,
+    source: str = "generated",
+) -> list[dict]:
+    """围绕年代物件/集体记忆【生成】唤起型素材，逐条过 evaluate_story 评分入库。
+
+    取代"爬别人故事再洗稿"：零侵权、强对号入座、天然契合换轴后的评分体系。
+    """
+    themes = themes or list(_THEME_ANCHORS.keys())
+    database.init_db()
+    accepted = []
+    for theme in themes:
+        anchors = "、".join(_THEME_ANCHORS.get(theme, []))
+        logger.info(f"生成唤起型素材：主题={theme}，目标 {n_per_theme} 条")
+        result = call_llm(
+            _GENERATE_PROMPT.format(theme=theme, n=n_per_theme, anchors=anchors),
+            system="You are a helpful assistant that outputs valid JSON.",
+            temperature=0.9,
+            prefer="script",  # 生成用强模型，质量优先
+        )
+        if not result or "stories" not in result:
+            logger.warning(f"主题 {theme} 生成失败或无 stories 字段，跳过")
+            continue
+        for story in result["stories"]:
+            if not isinstance(story, str) or len(story.strip()) < 80:
+                continue
+            r = evaluate_story(story.strip(), source=f"{source}_{theme}", force_theme=theme)
+            if r:
+                accepted.append(r)
+            time.sleep(1.0)  # 保护 API 限速
+    logger.info(f"唤起型素材生成完成：送审通过并入库候选 {len(accepted)} 条")
+    return accepted
 
 
 if __name__ == "__main__":

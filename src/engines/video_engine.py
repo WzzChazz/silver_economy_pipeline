@@ -21,7 +21,6 @@ import tempfile
 import time
 from typing import Optional
 
-import edge_tts
 from dotenv import load_dotenv
 
 from src.core import database
@@ -37,12 +36,38 @@ BROLLS_DIR = os.path.join(ASSETS_DIR, "brolls")
 BGMS_DIR   = os.path.join(ASSETS_DIR, "bgms")
 FONT_PATH  = os.getenv("FONT_PATH", "Arial-Unicode-MS")
 
+# ffmpeg/ffprobe：优先用 .env 指定，其次项目内 bin/（静态二进制，绕过系统未装 ffmpeg），最后回退 PATH
+_LOCAL_FFMPEG  = os.path.join(BASE_DIR, "bin", "ffmpeg")
+_LOCAL_FFPROBE = os.path.join(BASE_DIR, "bin", "ffprobe")
+FFMPEG  = os.getenv("FFMPEG_PATH")  or (_LOCAL_FFMPEG  if os.path.exists(_LOCAL_FFMPEG)  else "ffmpeg")
+FFPROBE = os.getenv("FFPROBE_PATH") or (_LOCAL_FFPROBE if os.path.exists(_LOCAL_FFPROBE) else "ffprobe")
+
 for d in [ASSETS_DIR, OUTPUT_DIR, BROLLS_DIR, BGMS_DIR]:
     os.makedirs(d, exist_ok=True)
 for t in ["父母爱情", "金婚岁月", "年代记忆", "儿女孝心"]:
     os.makedirs(os.path.join(BROLLS_DIR, t), exist_ok=True)
 
 SERIES_NAMES = ["《老照片里的爱情》", "《爸妈年轻时》", "《时光纪念册》", "《老来伴》", "《岁月如歌》"]
+
+# 叙事结构库（与 _SCRIPT_PROMPT 结构库一一对应）。
+# LLM 单条独立调用、无法感知上一条用了什么，故由代码按集数做确定性轮换指针，
+# 强制结构循环，防止连续多条撞同一种开头（防连撞）。
+NARRATIVE_STRUCTURES = [
+    "A. 唤起型（你家是不是也有…）",
+    "B. 悬念物件型（从有故事的老物件切入，正向悬念）",
+    "C. 数字反差型（用具体年代数字制造反差）",
+    "D. 第一人称自述（老人独白，情感浓）",
+    "E. 今昔对比型（古今对照）",
+    "F. 提问代入型（唤起回忆/倾诉欲）",
+    "G. 纯白描叙事（零钩子，纯集体记忆情绪）",
+]
+
+
+def _pick_structure_hint(identity: dict) -> str:
+    """按集数确定性轮换出本条优先结构；无集数时随机，保证多样性。"""
+    episode = identity.get("episode")
+    idx = (episode - 1) if episode else random.randrange(len(NARRATIVE_STRUCTURES))
+    return NARRATIVE_STRUCTURES[idx % len(NARRATIVE_STRUCTURES)]
 
 
 def _account_identity(account: dict = None, persona: str = "退休老人") -> dict:
@@ -67,70 +92,86 @@ def _account_identity(account: dict = None, persona: str = "退休老人") -> di
 # 文案生成（五段式脚本 + A/B 封面 + 评论钩子）
 # ============================================================
 _SCRIPT_PROMPT = """
-你是专注微信视频号「中老年家庭情感」赛道的顶级操盘手。
-核心目标只有一个：让这条视频能被中老年用户【转发到家族群/朋友圈】，并引导有需求的子女私信做纪念视频。
-请提炼历史高播放样本的底层逻辑（情绪共鸣、转发动机、安全感），应用到新创作，而不是照抄原句。
+你是专注微信视频号「老照片·家庭回忆」赛道的顶级操盘手。
+账号唯一价值主张：帮用户唤起并留住「爸妈年轻时 / 那个年代」的家庭记忆。
+本条视频的真正目标不是“讲一个催泪故事”，而是让刷到的中老年用户【对号入座，想起自己家里那一张具体的老照片】——
+对号入座 = 想转给家人（起量）+ 想自己也留一份（变现种子），这两件事是同一个动作的两面。
 
-请把这段【真实高赞素材】改写为一条 30~45 秒的爆款短视频口播脚本：
+把下面这段【唤起型素材】改写成一条 15~25 秒的口播脚本（这是“勾起回忆”的引子，不要照抄）：
 "{story}"
 
-人设 IP："{persona}"（固定旁白，性别已定：{narrator_gender}，全程保持一致，不得更改）
+人设 IP："{persona}"（固定旁白，性别已定：{narrator_gender}，全程一致，不得更改）
 主题方向：{theme}
 当前日期：{current_date}
 
-【防侵权洗稿】必须打乱原故事的时间线、地名、姓名、职业等设定做二次艺术加工，只保留核心情绪共鸣点。
+【硬性长度——最重要】
+1. 口播正文总字数严格 60~90 字（约 15~25 秒），宁短勿长。数据证明超过 25 秒用户就划走。
+2. 用 \\n 断句，每行不超过 10 字，总行数 5~8 行。
 
-【硬性长度要求——最重要】
-1. 口播正文总字数严格控制在 110~150 字之间（约 30~45 秒），宁短勿长。视频太长完播率必死。
-2. 用 \\n 断句，每行不超过 10 字，总行数 8~12 行。
+【叙事结构——核心规则：从结构库挑一种，严禁每条都用同一种开头】
+绝对不要每条都用“你家是不是也有”这种开头——结构雷同 = 账号像机器套模板，刷三条就腻，平台判同质化限流。
+下面是 7 种开头/叙事结构，请根据本条素材的特质，挑【一种】最贴的来写：
+   A. 唤起型：“你家是不是也有…”——第二人称直接点用户，适合通用老照片。
+   B. 悬念物件型：“这张照片我妈在箱底压了30年，我出嫁那天才翻出来…”——从有故事的物件切入制造悬念（悬念只能靠“未揭晓的温情”，绝不能靠“谁走了/谁病了”）。
+   C. 数字反差型：“1983年我爸月薪38块，却…”——用具体年代数字制造反差。
+   D. 第一人称自述：“我叫张桂兰，今年71…”——人设强、情感浓时用第一人称独白。
+   E. 今昔对比型：“现在婚纱照拍几万张，我爸妈这辈子就一张黑白的”——古今对照。
+   F. 提问代入型：“你还记得爸妈年轻时长什么样吗？”——唤起愧疚或倾诉欲。
+   G. 纯白描叙事：“那个年代结婚，一辆二八自行车就把媳妇娶回家”——零钩子，纯集体记忆情绪。
+【本条结构建议】本条请优先采用：{structure_hint}（若该结构与素材实在不搭可换一种，但绝不要用最近几条重复的结构）。
+通用底线：禁抽象说理开头（不能用“人到晚年才明白…”）；除 G 外尽量让用户能“对号入座”到自己家。
+【结构红线·所有结构通用】无论用哪种结构（尤其 B 悬念型、D 自述型），都绝对不许出现“去世/走了/病了/住院/最后一面/再也…”等死亡或卖惨字眼——这类必被限流且压转发。悬念与情感一律走【温情、惊喜、重逢、怀念】等正向方向。
 
-【完播率命门：前 3 秒钩子】
-开头第一句（前 2 行）必须是一个【具体的画面/物件/动作】瞬间抓人，且制造悬念或情绪冲击。
-例：“翻出妈妈年轻时的照片”“爸结婚那天就拍过一张”。
-绝对禁止抽象说理开头（不能用“人到晚年才明白”）。
-【限流红线】绝对禁止两类内容：
-1. 医院/看病/生病/卖惨/独居孤独/老伴去世/“去了趟医院才明白”——负向、易限流、无转发基因。
-2. 死亡紧迫感/晦气措辞：“趁父母还在/趁还来得及/再不做就来不及/子欲养而亲不待”——会被举报、抑制转发。
-孝心一律用【惊喜 / 陪伴 / 感恩 / 节日】正向框架表达（如“给爸妈一个惊喜”“他们看了特别开心”），而非“怕失去”。
+【正文：情感价值 +（尽量）轻遗憾埋变现痛点】
+中段给足年代感的情绪价值（那个年代没有婚纱钻戒，却笑得那么好看…）；
+在不破坏所选结构的前提下，结尾前【轻轻】点一句“遗憾”：照片放久了泛黄、模糊、边角卷了（纯白描型 G 可省略）。
+只埋痛点，绝不在口播里给解决方案、不提“修复/小程序/做视频”。
 
-【转发基因——决定能不能起量】
-内容必须让中老年人“想转给家人”。优先走以下正向、温暖、有年代感的方向（按主题适配腔调）：
-   - 父母爱情：年代感，老物件（旧照片、旧毛衣、搪瓷缸），怀念温情。
-   - 金婚岁月：相守一生的细节（一碗热面、起夜倒水），平实深情。
-   - 年代记忆：那个年代的集体回忆（粮票、老挂历、黑白婚纱照），唤起共鸣。
-   - 儿女孝心：子女视角的愧疚与陪伴（常年在外、给爸妈做点什么），引发“该多陪陪父母”的共鸣。
+【限流红线·绝对禁止】
+1. 医院/看病/生病/卖惨/独居孤独/老伴去世——负向、易限流、无转发基因。
+2. 死亡紧迫感：“趁父母还在/趁还来得及/子欲养而亲不待”——会被举报、压转发。
+孝心一律用【惊喜/陪伴/感恩/节日】正向框架。
 
-【结尾：只放转发钩子，不要在口播里导流（很重要）】
-viral_text 最后 1~2 行只写一句“转发动机”话术，引导【站内转发】——这是起量命脉且平台安全。
-口播正文【绝对不要】出现“主页找我/私信我/加微信”等导流词（口播里喊导流=营销号，会限流且没人转）。
-转发钩子按 narrator_gender 适配视角：
-   - 老人视角（male/female 老人自述）：引导老人把内容递给子女，如“家里有老照片的，转给孩子看看”。
-   - 子女视角（儿女孝心类）：引导转给家人，如“有同感的，转给你的兄弟姐妹”。
+【钩子——核心规则：动态匹配，宁缺毋滥，严禁每条都套同一套】
+不要把“互动+追更+转发”三件套全塞进去。请你先判断这条内容的类型与情绪，
+再从下面钩子库里【最多挑 1~2 个最贴的】放进结尾；情感特别浓的纯情绪片，可以一个钩子都不放，只靠内容。
+切忌每条视频钩子雷同——雷同会被平台判为模板营销号而限流。
 
-【封面钩子】生成 3 版（cover_a/b/c），各 8 字内、分两行用 \\n，从以下选 3 种不同类型：
+钩子库（按内容类型适配，挑最自然的，不要硬套）：
+A. 互动钩子（报年份/报数字型，零成本最易接话）：
+   结婚照→“你家爸妈哪年结的婚？评论区报个年份”；合影→“照片里你几岁？”；全家福→“你家全家福几口人？”；老物件→“你家还有这个吗？”
+B. 追更钩子（主题合集+集齐心理，给“不关注会错过”的理由，关联系列名）：
+   “这个《那个年代》系列我整理了一整套，关注我别错过下一张”“那个年代的结婚习俗我要讲完一整组”。
+C. 转发钩子（站内转发，起量命脉）：按 narrator_gender 适配——
+   老人自述→“家里有老照片的，转给孩子看看”；子女视角→“有同感的，转给兄弟姐妹”。
+
+【口播红线】正文【绝对不要】出现“主页找我/私信/加微信/小程序/教程”等导流词（起号期口播喊导流=营销号，限流且没人转）。
+
+【封面钩子】生成 3 版（cover_a/b/c），各 8 字内、两行用 \\n，从以下选 3 种不同类型：
 1.年龄型 2.反问型 3.场景代入型 4.对比冲突型 5.身份认同型 6.结论前置型 7.悬念留白型 8.数字具体型。
 
-【评论区置顶文案 comment_hook】（结合日期/季节/节日，第一人称带情感，不超过 40 字）
+【评论区带头评论 comment_hook】（这是你用小号置顶、给用户“示范怎么接话”的那条，第一人称、真诚、不超过 40 字）
 {comment_hook_rule}
 
-【画面描述词 image_prompt】一句 20 字内高清画面描述词用于 AI 绘图：
-- 必须是中国老人面貌、有年代感与生活气息；动作与剧情物件强相关。
-- 按 narrator_gender：male 写“中国老爷爷”，female 写“中国老奶奶”。
-- 若出现文字物件（旧信、账本）须注明“中文手写体”。
-示例：一位满头白发的中国老奶奶，捧着泛黄的黑白结婚照，神情温柔，写实风格。
+【画面描述词 image_prompt】一句 20 字内画面描述，主体是【一张有年代感的老照片/老物件】而非现画人脸：
+- 突出“泛黄、黑白、胶片感、旧相册”等真实老照片质感，弱化具体人脸。
+- 示例：泛黄的黑白结婚照躺在旧相册里，胶片颗粒感，怀旧暖调，写实。
 
-参考历史爆款风格（Few-shot）：
+参考历史高互动样本风格（Few-shot）：
 {few_shot_examples}
 
 输出严格 JSON（不含多余文字）：
 {{
-    "learning_analysis": "（内部复盘）本条如何设计转发动机和前3秒钩子",
-    "viral_text": "正文 110~150字，\\n 断句，结尾只含转发钩子（不要导流词）",
-    "image_prompt": "画面描述词",
+    "learning_analysis": "（内部复盘）本条用了哪种叙事结构（A~G）、勾起了哪张照片的对号入座、挑了哪个钩子、钩子密度是否克制",
+    "viral_text": "正文 60~90字，\\n 断句，第二人称唤起开头+轻遗憾，结尾按内容动态挑0~2个钩子（不要导流词）",
+    "image_prompt": "老照片/老物件画面描述词",
+    "hooks_used": "本条实际用了哪些钩子（如：互动+转发 / 仅转发 / 无），便于人工核对钩子密度",
+    "interaction_hook": "本条采用的互动提问（没用则空字符串）",
+    "follow_hook": "本条采用的追更/集齐话术（没用则空字符串）",
     "cover_a": "类型X\\n封面",
     "cover_b": "类型Y\\n封面",
     "cover_c": "类型Z\\n封面",
-    "comment_hook": "评论区置顶文案"
+    "comment_hook": "小号带头评论的示范文案"
 }}
 """
 
@@ -199,6 +240,8 @@ def generate_viral_script(account: dict = None) -> Optional[dict]:
 
     stage = _monetize_stage()
     logger.info(f"变现阶段 MONETIZE_STAGE={stage}（0起号/1起量/2变现）")
+    structure_hint = _pick_structure_hint(identity)
+    logger.info(f"本条叙事结构（轮换防连撞）：{structure_hint}")
     result = call_llm(_SCRIPT_PROMPT.format(
         story=raw_story,
         persona=chosen_persona,
@@ -207,6 +250,7 @@ def generate_viral_script(account: dict = None) -> Optional[dict]:
         current_date=current_date,
         few_shot_examples=few_shot_examples,
         comment_hook_rule=_comment_hook_rule(stage),
+        structure_hint=structure_hint,
     ), system="You are a helpful assistant that outputs valid JSON.",
        temperature=0.85, prefer="script")
 
@@ -241,28 +285,156 @@ def _fallback_script(story_id=None, theme="父母爱情", identity=None) -> dict
         "theme":       theme,
         "scene":       "home",
         "persona":     "退休老人",
-        "learning_analysis": "兜底：老照片+父母爱情，靠年代感共鸣驱动转发，结尾软引流私域代做。",
+        "learning_analysis": "兜底：第二人称唤起『你家那张老照片』，轻点泛黄遗憾，结尾仅互动+转发钩子（起号期不导流）。",
         "narrator_gender": identity["narrator_gender"],
         "series_title": series_title,
-        "viral_text":  "翻出爸妈年轻时\n那张黑白照片\n那个年代没有婚纱\n一件的确良衬衫\n就是最好的体面\n他们没说过爱\n却把一辈子\n过成了情话\n这样的老照片\n配上音乐\n爸妈看了\n准乐开花\n家里有老照片的\n转给孩子看看",
-        "image_prompt": "一对中国老夫妻捧着泛黄的黑白结婚照，神情温柔怀念，年代感，写实风格。",
+        # 短文案（约18秒）：第二人称唤起开头 + 轻遗憾 + 互动钩子 + 转发钩子
+        "viral_text":  "你家是不是也有\n一张爸妈年轻时\n的黑白合影\n那个年代没婚纱\n却笑得真好看\n可惜放久了\n都泛黄模糊了\n你家爸妈\n哪年结的婚\n评论区报个年份\n有老照片的\n转给孩子看看",
+        "image_prompt": "泛黄的黑白结婚照躺在旧相册里，胶片颗粒感，怀旧暖调，写实。",
+        "hooks_used":   "互动+转发",
+        "interaction_hook": "你家爸妈哪年结的婚？评论区报个年份",
+        "follow_hook":  "",
         "cover_a":     "爸妈年轻时\n有多好看",
         "cover_b":     "那个年代\n的爱情",
         "cover_c":     "黑白照片\n藏着情话",
+        # 小号带头评论（给用户示范怎么接话），起号期纯情感、不导流
         "comment_hook": (
-            "你还留着爸妈年轻时的照片吗？评论区聊聊他们的故事❤️"
+            "我家是1986年的，爸妈那会儿才二十出头，你家呢？❤️"
             if _monetize_stage() == 0 else
-            "你还留着爸妈年轻时的照片吗？评论区聊聊，想做同款的主页有教程❤️"
+            "我家是1986年的，你家呢？好多人问这种老照片咋做的，整理在主页啦❤️"
         ),
     }
 
 
 # ============================================================
-# TTS 生成
+# TTS 生成（F5 真人克隆音 / edge-tts 双后端，TTS_BACKEND 切换）
+# ============================================================
+VOICES_DIR = os.path.join(ASSETS_DIR, "voices")
+_f5_model = None  # 模型缓存：批量生产只加载一次
+
+
+def _get_f5_model():
+    """懒加载并缓存 F5-TTS 模型。"""
+    global _f5_model
+    if _f5_model is None:
+        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")  # HF 镜像，防模型下载失败
+        from f5_tts.api import F5TTS
+        _f5_model = F5TTS()
+        logger.info("F5-TTS 模型加载完成（已缓存）")
+    return _f5_model
+
+
+def _ref_voice(gender: str):
+    """按性别取参考音 (audio_path, ref_text)；缺失逐级回退 gender→female→male。"""
+    exts = ("wav", "mp3", "m4a", "flac")
+    for g in [gender, "female", "male"]:
+        txt = os.path.join(VOICES_DIR, f"{g}.txt")
+        if not os.path.exists(txt):
+            continue
+        for c in sorted(glob.glob(os.path.join(VOICES_DIR, f"{g}.*"))):
+            if c.rsplit(".", 1)[-1].lower() in exts:
+                with open(txt, encoding="utf-8") as f:
+                    return c, f.read().strip()
+    return None, None
+
+
+def _f5_generate(text: str, output_path: str, gender: str):
+    """F5-TTS 克隆音合成（同步、重计算，由 generate_audio 用线程池调用）。"""
+    import torch
+    import torchaudio
+    import torchaudio.functional as AF
+
+    ref_audio, ref_text = _ref_voice(gender)
+    if not ref_audio:
+        raise RuntimeError(f"参考音缺失：请在 {VOICES_DIR} 放 {gender}.wav/.mp3 + 同名 .txt")
+
+    model = _get_f5_model()
+    logger.info(f"F5 克隆音推理中：ref={os.path.basename(ref_audio)} gender={gender}")
+    wav, sr, _ = model.infer(ref_file=ref_audio, ref_text=ref_text, gen_text=text)
+
+    waveform = torch.tensor(wav).unsqueeze(0)
+    steps = float(os.getenv("F5_PITCH_STEPS", "2.5"))
+    if steps:
+        waveform = AF.pitch_shift(waveform, sr, n_steps=steps)
+
+    # F5 输出 wav；主流程音频路径是 .mp3，先存临时 wav 再 ffmpeg 转码
+    tmp_wav = output_path + ".f5.wav"
+    torchaudio.save(tmp_wav, waveform, sr)
+    subprocess.run([FFMPEG, "-y", "-i", tmp_wav, output_path],
+                   check=True, capture_output=True)
+    os.remove(tmp_wav)
+
+
+def _minimax_generate(text: str, output_path: str, gender: str):
+    """MiniMax 海螺语音合成（云端，Intel mac 无障碍；直接返回 mp3，无需 ffmpeg 转码）。"""
+    import httpx
+    api_key  = os.getenv("MINIMAX_API_KEY", "")
+    group_id = os.getenv("MINIMAX_GROUP_ID", "")
+    if not api_key or not group_id:
+        raise RuntimeError("MiniMax 需配置 MINIMAX_API_KEY 与 MINIMAX_GROUP_ID")
+
+    if gender == "female":
+        voice_id = os.getenv("MINIMAX_VOICE_FEMALE", "Chinese (Mandarin)_Wise_Women")
+    else:
+        voice_id = os.getenv("MINIMAX_VOICE_MALE", "Chinese (Mandarin)_Gentleman")
+    model = os.getenv("MINIMAX_MODEL", "speech-01-turbo")
+
+    url = f"https://api.minimax.chat/v1/t2a_v2?GroupId={group_id}"
+    payload = {
+        "model": model,
+        "text": text,
+        "stream": False,
+        "voice_setting": {
+            "voice_id": voice_id,
+            "speed": float(os.getenv("MINIMAX_SPEED", "1.0")),
+            "vol": 1.0,
+            "pitch": int(os.getenv("MINIMAX_PITCH", "0")),
+        },
+        "audio_setting": {"sample_rate": 32000, "bitrate": 128000, "format": "mp3"},
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    logger.info(f"MiniMax 合成中：voice={voice_id} gender={gender}")
+    with httpx.Client(timeout=60) as client:
+        resp = client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+    data = resp.json()
+    audio_hex = (data.get("data") or {}).get("audio")
+    if not audio_hex:
+        raise RuntimeError(f"MiniMax 无音频返回：{data.get('base_resp', data)}")
+    with open(output_path, "wb") as f:
+        f.write(bytes.fromhex(audio_hex))
+
+
+async def _to_thread(func, *args):
+    """Python 3.8 兼容：替代 3.9+ 的 asyncio.to_thread（把同步重计算丢线程池）。"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, func, *args)
+
+
 async def generate_audio(text: str, output_path: str, gender: str = "male"):
+    """TTS 总入口。TTS_BACKEND ∈ {edge, minimax, f5}；云/克隆失败自动降级 edge-tts。"""
     import re
-    # 移除大模型生成的 SSML 标签，防止破坏 edge-tts 底层 XML 结构导致 NoAudioReceived
-    clean_text = re.sub(r'<[^>]+>', '', text)
+    # 移除大模型可能生成的 SSML 标签，防止破坏 edge-tts XML 导致 NoAudioReceived
+    clean_text = re.sub(r'<[^>]+>', '', text).strip()
+
+    backend = os.getenv("TTS_BACKEND", "edge").lower()
+    if backend == "minimax":
+        try:
+            await _to_thread(_minimax_generate, clean_text, output_path, gender)
+            logger.info(f"MiniMax 语音完成：{output_path}")
+            return
+        except Exception as e:
+            logger.error(f"MiniMax 失败，降级 edge-tts：{e}")
+    elif backend == "f5":
+        try:
+            await _to_thread(_f5_generate, clean_text, output_path, gender)
+            logger.info(f"F5 克隆音完成：{output_path}")
+            return
+        except Exception as e:
+            logger.error(f"F5 克隆音失败，降级 edge-tts：{e}")
+
+    # edge-tts（默认 / F5 兜底）—— 懒加载，F5-only 环境无需安装 edge_tts
+    import edge_tts
     if gender == "female":
         voice = os.getenv("TTS_VOICE_MODEL_FEMALE", "zh-CN-liaoning-XiaobeiNeural")
         rate  = os.getenv("TTS_SPEECH_RATE", "-15%")
@@ -271,10 +443,10 @@ async def generate_audio(text: str, output_path: str, gender: str = "male"):
         voice = os.getenv("TTS_VOICE_MODEL", "zh-CN-YunjianNeural")
         rate  = os.getenv("TTS_SPEECH_RATE", "-10%")
         pitch = os.getenv("TTS_PITCH", "-10Hz")
-    logger.info(f"TTS 生成中 (已清理 SSML)：voice={voice}, gender={gender}")
+    logger.info(f"TTS=edge 生成中：voice={voice}, gender={gender}")
     communicate = edge_tts.Communicate(clean_text, voice, rate=rate, pitch=pitch)
     await communicate.save(output_path)
-    logger.info(f"TTS 完成：{output_path}")
+    logger.info(f"edge-tts 完成：{output_path}")
 
 
 # ============================================================
@@ -288,12 +460,11 @@ def _get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
         import whisper
-        import imageio_ffmpeg
         import numpy as np
 
         def _load_audio(file, sr=16000):
             cmd = [
-                imageio_ffmpeg.get_ffmpeg_exe(), "-nostdin", "-threads", "0",
+                FFMPEG, "-nostdin", "-threads", "0",
                 "-i", file, "-f", "s16le", "-ac", "1",
                 "-acodec", "pcm_s16le", "-ar", str(sr), "-"
             ]
@@ -357,9 +528,13 @@ def get_whisper_timestamps(audio_path: str, text: str) -> list[dict]:
 
 
 def _uniform_timestamps(audio_path: str, text: str) -> list[dict]:
-    """Whisper 降级：均匀分配时间戳"""
+    """Whisper 降级：均匀分配时间戳（不看实际语音，字幕极易与配音错位）。"""
+    logger.warning(
+        "字幕走【均匀分配】降级 —— 未用 Whisper 逐字对齐，字幕大概率与配音对不上。"
+        "请确认已安装 openai-whisper 且能加载 small 模型（详见 docs/装机与配音指南.md C 节）。"
+    )
     result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+        [FFPROBE, "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
         capture_output=True, text=True
     )
@@ -414,6 +589,77 @@ def generate_ai_background(image_prompt: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"智谱 AI 绘图失败: {e}")
         return None
+
+
+# 年代空镜 prompt 库：刻意【不含人脸】（人脸是AI假感的测谎点），只画年代物件/场景，竖构图、胶片质感
+BG_SCENE_PROMPTS = {
+    "父母爱情": [
+        "褪色的旧情书和一支钢笔放在木桌上，泛黄信纸，暖黄灯光，怀旧，无人物，写实摄影，竖构图",
+        "一件的确良衬衫挂在老式木衣架上，斑驳墙面，年代感，无人物，写实摄影，竖构图",
+        "旧搪瓷缸和一把铜钥匙放在木桌上，暖黄灯光，怀旧，无人物，写实摄影，竖构图",
+    ],
+    "金婚岁月": [
+        "两把并排的旧藤椅放在老屋窗前，夕阳暖光，温情，无人物，写实摄影，竖构图",
+        "一碗冒热气的汤面放在斑驳木桌上，家常温暖，怀旧，无人物，写实摄影，竖构图",
+        "缝补过的旧毛衣和老花镜放在一起，柔和光线，年代感，无人物，写实摄影，竖构图",
+    ],
+    "年代记忆": [
+        "墙上老式挂历特写，泛黄纸张，八十年代风格，无人物，写实摄影，竖构图",
+        "粮票和布票特写，泛黄旧纸，浓郁年代感，无人物，写实摄影，竖构图",
+        "老式黑白电视机放在木柜上，怀旧客厅一角，无人物，写实摄影，竖构图",
+    ],
+    "儿女孝心": [
+        "一个旧帆布书包挂在木门后，怀旧暖调，无人物，写实摄影，竖构图",
+        "一件小孩的旧棉袄叠放在老木箱上，怀旧暖调，无人物，写实摄影，竖构图",
+        "一摞旧小学课本和铁皮铅笔盒放在木桌上，怀旧光线，无人物，写实摄影，竖构图",
+    ],
+}
+
+
+def generate_background_library(themes: list = None, n_per_theme: int = 3) -> list:
+    """用 CogView 批量生成【年代空镜】背景，存入 brolls/{主题}/ 供 produce 复用。
+
+    预生成（而非每条现画）：省钱、可人工筛选、可复用；只画物件不画人脸，降低 AI 假感。
+    """
+    zhipu_api_key = os.getenv("ZHIPU_API_KEY")
+    if not zhipu_api_key or "your-" in zhipu_api_key:
+        logger.error("未配置有效 ZHIPU_API_KEY，无法生成背景素材库")
+        return []
+    import httpx
+    import urllib.request
+    import uuid
+    api_url = "https://open.bigmodel.cn/api/paas/v4/images/generations"
+    headers = {"Authorization": f"Bearer {zhipu_api_key}", "Content-Type": "application/json"}
+    themes = themes or list(BG_SCENE_PROMPTS.keys())
+    saved = []
+    for theme in themes:
+        prompts = BG_SCENE_PROMPTS.get(theme, [])[:n_per_theme]
+        theme_dir = os.path.join(BROLLS_DIR, theme)
+        os.makedirs(theme_dir, exist_ok=True)
+        for p in prompts:
+            for attempt in range(4):
+                try:
+                    logger.info(f"CogView 生成背景：{theme} | {p[:24]}…")
+                    resp = httpx.post(api_url, headers=headers, timeout=90,
+                        json={"model": "cogview-3-plus", "prompt": p, "watermark_enabled": False})
+                    resp.raise_for_status()
+                    url = resp.json()["data"][0]["url"]
+                    out = os.path.join(theme_dir, f"bg_{uuid.uuid4().hex[:8]}.jpg")
+                    urllib.request.urlretrieve(url, out)
+                    saved.append(out)
+                    logger.info(f"已保存背景：{out}")
+                    break
+                except Exception as e:
+                    if "429" in str(e) and attempt < 3:
+                        wait = 20 * (attempt + 1)
+                        logger.warning(f"智谱限流 429，{wait}s 后重试（{attempt+1}/3）")
+                        time.sleep(wait)
+                        continue
+                    logger.error(f"背景生成失败（{theme}）：{e}")
+                    break
+            time.sleep(6)  # 智谱限流（RPM）：每张间隔，避免 429
+    logger.info(f"背景素材库生成完成，共 {len(saved)} 张")
+    return saved
 
 
 def _pick_background(theme: str, scene: str = "") -> Optional[str]:
@@ -499,7 +745,7 @@ def create_video(
         mixed_audio = os.path.join(tmp, "mixed.aac")
         if bgm_path and os.path.exists(bgm_path):
             subprocess.run([
-                "ffmpeg", "-y",
+                FFMPEG, "-y",
                 "-i", audio_path,
                 "-i", bgm_path,
                 "-filter_complex",
@@ -537,12 +783,12 @@ def create_video(
             )
 
         cmd = [
-            "ffmpeg", "-y",
+            FFMPEG, "-y",
             *video_input,
             "-i", mixed_audio,
             "-vf", vf,
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",  # 视频号标准：立体声 44.1kHz，防部分播放器/平台无声
             "-shortest",
             "-movflags", "+faststart",
             output_path,
@@ -589,7 +835,7 @@ def generate_cover(
     )
 
     cmd = [
-        "ffmpeg", "-y",
+        FFMPEG, "-y",
         *input_args,
         "-vf",
         f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
@@ -625,6 +871,57 @@ def generate_ab_covers(
 
 
 # ============================================================
+# 发布助手：把所有钩子聚合成一份手动发布清单
+# ============================================================
+def _write_publish_guide(output_dir: str, script_data: dict, series_title: str):
+    """把口播、封面、互动/追更/转发钩子、小号带头评论聚合成 publish_guide.txt。
+
+    手动发布时照这份"剧本"操作：发什么文案、评论区先用小号发哪条、怎么引导追更。
+    钩子由 LLM 按内容动态挑选（可能为空），这里只忠实呈现本条实际生成了什么。
+    """
+    stage = _monetize_stage()
+    stage_name = {0: "起号期（纯情感·不引流）", 1: "起量期（评论区软引流）", 2: "变现期（明确承接）"}.get(stage, "起号期")
+
+    interaction = (script_data.get("interaction_hook") or "").strip()
+    follow      = (script_data.get("follow_hook") or "").strip()
+    comment     = (script_data.get("comment_hook") or "").strip()
+    hooks_used  = (script_data.get("hooks_used") or "未标注").strip()
+
+    lines = [
+        f"# 发布助手  |  {series_title}  |  阶段：{stage_name}",
+        "=" * 50,
+        "",
+        "【1. 口播正文 / 视频文案】",
+        script_data.get("viral_text", ""),
+        "",
+        "【2. 本条实际采用的钩子】（核对密度，避免每条都雷同）",
+        f"  hooks_used：{hooks_used}",
+        "",
+        "【3. 评论区第一步——用小号置顶这条『带头评论』】",
+        f"  {comment if comment else '（本条无，纯情感片可不带）'}",
+        "  ↑ 银发用户需要被示范怎么接话，发完手动置顶，并主动回复前几条真实评论。",
+        "",
+        "【4. 互动引导】（若口播已含则无需重复）",
+        f"  {interaction if interaction else '（本条未设互动钩子）'}",
+        "",
+        "【5. 追更引导】（给『不关注会错过』的理由）",
+        f"  {follow if follow else '（本条未设追更钩子）'}",
+        "",
+        "【6. 封面三版 A/B 测试】",
+        f"  A：{script_data.get('cover_a','')}".replace("\n", " "),
+        f"  B：{script_data.get('cover_b','')}".replace("\n", " "),
+        f"  C：{script_data.get('cover_c','')}".replace("\n", " "),
+    ]
+    if stage == 0 and (interaction or follow or comment):
+        lines += ["", "※ 起号期提醒：口播与评论区均不得出现主页/小程序/教程等导流词，只做情感互动。"]
+
+    guide_path = os.path.join(output_dir, "publish_guide.txt")
+    with open(guide_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    logger.info(f"发布助手已保存：{guide_path}（hooks={hooks_used}）")
+
+
+# ============================================================
 # 主流程
 # ============================================================
 async def main(account: dict = None):
@@ -647,7 +944,10 @@ async def main(account: dict = None):
         logger.info(f"【大模型复盘反思】\n{script_data['learning_analysis']}\n")
     logger.info(f"脚本：\n{viral_text}")
     logger.info(f"封面A：{script_data.get('cover_a', '')}  B：{script_data.get('cover_b', '')}  C：{script_data.get('cover_c', '')}")
-    logger.info(f"评论钩子：{comment_hook}")
+    logger.info(f"钩子密度：{script_data.get('hooks_used', '未标注')}")
+    logger.info(f"互动钩子：{script_data.get('interaction_hook', '') or '（无）'}")
+    logger.info(f"追更钩子：{script_data.get('follow_hook', '') or '（无）'}")
+    logger.info(f"带头评论：{comment_hook}")
     logger.info(f"{'='*50}\n")
 
     # 路径准备：按日期和主题生成专属隔离包
@@ -700,12 +1000,9 @@ async def main(account: dict = None):
         )
         logger.info(f"数据闭环记录完成，生产 ID：{prod_id}")
 
-    # 输出评论钩子（供手动复制）
-    if comment_hook:
-        hook_path = os.path.join(output_dir, "comment_hook.txt")
-        with open(hook_path, "w", encoding="utf-8") as f:
-            f.write(comment_hook)
-        logger.info(f"评论钩子已保存：{hook_path}")
+    # 发布助手：把口播/封面/各类钩子聚合成一份手动发布清单
+    # （钩子生成了却不落盘 = 等于没做。这份文件是你手动发布时照着抄的"剧本"）
+    _write_publish_guide(output_dir, script_data, series_title)
 
 
 if __name__ == "__main__":

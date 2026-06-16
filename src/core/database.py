@@ -268,39 +268,44 @@ def get_story_for_persona(
     """
     按人设 / 主题定向拉取，融合五维分、使用衰减、主题权重和随机性。
     score > 90 允许复用 10 次，否则 3 次。
+
+    软匹配（冷启动关键）：persona 是 LLM 生成的多样四字画像，账号 persona 很难精确命中。
+    故按 (persona+theme) → (仅 theme) → (全库) 逐级放宽，保证库里有货时一定能拉到，
+    不会因 persona 对不上就空手而归、退回兜底文案。
     """
-    with get_connection() as conn:
-        where_clauses = [
-            "used_count < (CASE WHEN score > 90 THEN 10 ELSE 3 END)",
-            f"score >= {min_score}",
-        ]
-        params = []
-        if persona:
-            where_clauses.append("persona = ?")
-            params.append(persona)
-        if theme:
-            where_clauses.append("theme = ?")
-            params.append(theme)
+    def _query(p: str = None, t: str = None):
+        with get_connection() as conn:
+            where_clauses = [
+                "used_count < (CASE WHEN score > 90 THEN 10 ELSE 3 END)",
+                f"score >= {min_score}",
+            ]
+            params = []
+            if p:
+                where_clauses.append("persona = ?")
+                params.append(p)
+            if t:
+                where_clauses.append("theme = ?")
+                params.append(t)
 
-        where_sql = " AND ".join(where_clauses)
-        row = conn.execute(f"""
-            SELECT id, theme, title, story, emotion, scene, persona,
-                   score, score_pain, score_truth, score_resonance,
-                   score_freshness, score_rewrite, theme_weight
-            FROM story_pool
-            WHERE {where_sql}
-            ORDER BY
-                (score * 0.5 * theme_weight)
-                + ((10 - used_count) * 3)
-                + (score_pain * 0.3)
-                + ABS(RANDOM() % 15)
-            DESC
-            LIMIT 1
-        """, params).fetchone()
+            where_sql = " AND ".join(where_clauses)
+            return conn.execute(f"""
+                SELECT id, theme, title, story, emotion, scene, persona,
+                       score, score_pain, score_truth, score_resonance,
+                       score_freshness, score_rewrite, theme_weight
+                FROM story_pool
+                WHERE {where_sql}
+                ORDER BY
+                    (score * 0.5 * theme_weight)
+                    + ((10 - used_count) * 3)
+                    + (score_pain * 0.3)
+                    + ABS(RANDOM() % 15)
+                DESC
+                LIMIT 1
+            """, params).fetchone()
 
-    if not row:
-        return None
-    return dict(row)
+    # 逐级放宽
+    row = _query(persona, theme) or _query(None, theme) or _query(None, None)
+    return dict(row) if row else None
 
 
 def mark_story_used(story_id: int):
@@ -423,13 +428,21 @@ def increment_account_post(account_id: str):
 
 
 def get_top_performing_scripts(limit: int = 3) -> list[dict]:
-    """获取完播率最高的爆款视频脚本作为 Few-shot 示例"""
+    """获取【高互动】爆款脚本作为 Few-shot 示例。
+
+    本赛道命门是转发/裂变而非完播率——一条 6000+ 播放往往靠转发滚出来、完播平平。
+    故 few-shot 选样按互动综合分排序（转发权重最高），而非完播率；
+    且不再用 watch_rate>0 过滤（RPA 抓不到完播率时该条 watch_rate 为 0/None，
+    旧逻辑会把这些真实爆款全部漏掉）。
+    """
     with get_connection() as conn:
         rows = conn.execute("""
-            SELECT viral_script, cover_title, watch_rate, views
+            SELECT viral_script, cover_title, watch_rate, views,
+                   likes, comments, shares,
+                   (shares * 3 + comments * 2 + likes) AS engage_score
             FROM production_history
-            WHERE viral_script IS NOT NULL AND watch_rate > 0
-            ORDER BY watch_rate DESC, views DESC
+            WHERE viral_script IS NOT NULL
+            ORDER BY engage_score DESC, views DESC
             LIMIT ?
         """, (limit,)).fetchall()
         return [dict(r) for r in rows]
