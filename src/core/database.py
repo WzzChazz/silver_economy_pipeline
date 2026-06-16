@@ -35,8 +35,9 @@ def _get_embed_model():
             from sentence_transformers import SentenceTransformer
             _embed_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
             logger.info("语义向量模型加载成功")
-        except ImportError:
-            logger.warning("sentence-transformers 未安装，将退回字面去重模式")
+        except Exception as e:
+            # ImportError（未安装）或 OSError（torch/ffmpeg 动态库缺失）等均降级到字面去重
+            logger.warning(f"语义向量模型不可用（{type(e).__name__}），退回字面去重模式：{e}")
     return _embed_model
 
 
@@ -196,46 +197,49 @@ def insert_story(
     if scores is None:
         scores = {"pain": 0, "truth": 0, "resonance": 0, "freshness": 0, "rewrite": 0}
 
-    # --- 叙事原型比例限制 ---
-    if narrative_type:
-        with get_connection() as conn:
-            total_count = conn.execute("SELECT COUNT(*) FROM story_pool").fetchone()[0]
-            if total_count > 50:
-                type_count = conn.execute("SELECT COUNT(*) FROM story_pool WHERE narrative_type = ?", (narrative_type,)).fetchone()[0]
-                if type_count / total_count > 0.2:
-                    logger.warning(f"叙事原型同质化拦截：'{narrative_type}' 占比已超过 20%")
-                    return False
-
-    # --- 语义去重 ---
+    # 向量在连接外算（CPU 密集，避免占着 DB 连接）
     embedding_vec = None
     model = _get_embed_model()
     if model:
         embedding_vec = model.encode(story).tolist()
-        with get_connection() as conn:
+    embedding_json = json.dumps(embedding_vec) if embedding_vec else None
+
+    # 原型限流 + 去重 + 入库共用一个连接 / 一个事务
+    with get_connection() as conn:
+        # --- 叙事原型比例限制 ---
+        if narrative_type:
+            total_count = conn.execute("SELECT COUNT(*) FROM story_pool").fetchone()[0]
+            if total_count > 50:
+                type_count = conn.execute(
+                    "SELECT COUNT(*) FROM story_pool WHERE narrative_type = ?",
+                    (narrative_type,),
+                ).fetchone()[0]
+                if type_count / total_count > 0.2:
+                    logger.warning(f"叙事原型同质化拦截：'{narrative_type}' 占比已超过 20%")
+                    return False
+
+        # --- 去重 ---
+        if embedding_vec is not None:
             rows = conn.execute(
                 "SELECT embedding FROM story_pool ORDER BY id DESC LIMIT 100"
             ).fetchall()
-        for row in rows:
-            if row["embedding"]:
-                old_vec = json.loads(row["embedding"])
-                if _cosine_similarity(embedding_vec, old_vec) > 0.85:
-                    logger.warning("语义去重拦截：故事与库内内容相似度过高")
-                    return False
-    else:
-        # 降级：字面 difflib
-        import difflib
-        with get_connection() as conn:
+            for row in rows:
+                if row["embedding"]:
+                    old_vec = json.loads(row["embedding"])
+                    if _cosine_similarity(embedding_vec, old_vec) > 0.85:
+                        logger.warning("语义去重拦截：故事与库内内容相似度过高")
+                        return False
+        else:
+            # 降级：字面 difflib
+            import difflib
             rows = conn.execute(
                 "SELECT story FROM story_pool ORDER BY id DESC LIMIT 50"
             ).fetchall()
-        for row in rows:
-            if difflib.SequenceMatcher(None, story, row["story"]).ratio() > 0.85:
-                logger.warning("字面去重拦截")
-                return False
+            for row in rows:
+                if difflib.SequenceMatcher(None, story, row["story"]).ratio() > 0.85:
+                    logger.warning("字面去重拦截")
+                    return False
 
-    embedding_json = json.dumps(embedding_vec) if embedding_vec else None
-
-    with get_connection() as conn:
         conn.execute("""
             INSERT INTO story_pool
                 (theme, title, story, emotion, scene, persona, source, narrative_type,
@@ -249,7 +253,7 @@ def insert_story(
             embedding_json,
         ))
 
-    total = scores["pain"] + scores["truth"] + scores["resonance"] + scores["freshness"] + scores["rewrite"]
+    total = sum(scores.values())
     logger.info(f"故事入库成功：theme={theme} score={total}")
     return True
 
@@ -329,13 +333,19 @@ def update_performance(
     likes: int,
     comments: int,
     shares: int,
-    watch_rate: float,
+    watch_rate: float = None,
 ):
-    """视频号数据回传，同时更新主题权重飞轮"""
+    """视频号数据回传，同时更新主题权重飞轮。
+
+    watch_rate 为 None 时（如 RPA 网页抓取拿不到完播率）只更新点赞侧信号，
+    不污染 avg_watch，避免把对应主题的 theme_weight 误归零。
+    """
     with get_connection() as conn:
+        # watch_rate 缺省则保留原值
         conn.execute("""
             UPDATE production_history
-            SET views=?, likes=?, comments=?, shares=?, watch_rate=?
+            SET views=?, likes=?, comments=?, shares=?,
+                watch_rate = COALESCE(?, watch_rate)
             WHERE id=?
         """, (views, likes, comments, shares, watch_rate, production_id))
 
@@ -346,9 +356,12 @@ def update_performance(
             WHERE ph.id = ?
         """, (production_id,)).fetchone()
 
-        if row:
-            theme = row["theme"]
-            # 滑动平均更新主题表现
+        if not row:
+            return
+        theme = row["theme"]
+
+        if watch_rate is not None:
+            # 完播率 + 点赞双信号滑动平均
             conn.execute("""
                 INSERT INTO theme_performance (theme, avg_watch, avg_likes, sample_count)
                 VALUES (?, ?, ?, 1)
@@ -359,15 +372,25 @@ def update_performance(
                     updated_at   = CURRENT_TIMESTAMP
             """, (theme, watch_rate, likes, watch_rate, likes))
 
-            # 用完播率归一化更新 story_pool.theme_weight
+            # 用完播率归一化更新 story_pool.theme_weight（缺测时维持默认 1.0）
             conn.execute("""
                 UPDATE story_pool
                 SET theme_weight = (
-                    SELECT COALESCE(avg_watch / 100.0 * 2.0, 1.0)
+                    SELECT COALESCE(NULLIF(avg_watch, 0) / 100.0 * 2.0, 1.0)
                     FROM theme_performance WHERE theme = story_pool.theme
                 )
                 WHERE theme = ?
             """, (theme,))
+        else:
+            # 无完播率：仅滑动平均点赞数，不动 avg_watch / theme_weight
+            conn.execute("""
+                INSERT INTO theme_performance (theme, avg_watch, avg_likes, sample_count)
+                VALUES (?, 0.0, ?, 1)
+                ON CONFLICT(theme) DO UPDATE SET
+                    avg_likes    = (avg_likes * sample_count + ?) / (sample_count + 1),
+                    sample_count = sample_count + 1,
+                    updated_at   = CURRENT_TIMESTAMP
+            """, (theme, likes, likes))
 
 
 # ---------- 账号矩阵 ----------
@@ -413,47 +436,79 @@ def get_top_performing_scripts(limit: int = 3) -> list[dict]:
 
 # ---------- 统计 ----------
 def get_stats() -> dict:
-    """返回故事库和账号基础统计信息"""
+    """返回故事库和账号统计信息，含主题分布与完播率飞轮快照。
+
+    key 命名以调用方（monitor / performance_api / story_engine）为准：
+    total / ready / total_accounts / active_accounts / by_theme / theme_performance
+    """
     with get_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM story_pool")
         total = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM story_pool WHERE used_count < 5 AND score >= 75")
         ready = c.fetchone()[0]
-        
+
         c.execute("SELECT COUNT(*) FROM account_matrix")
         total_accounts = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM account_matrix WHERE active=1")
         active_accounts = c.fetchone()[0]
 
+        # 主题分布（条数 + 均分）
+        by_theme = [
+            {"theme": r["theme"], "cnt": r["cnt"], "avg_score": r["avg_score"] or 0.0}
+            for r in c.execute("""
+                SELECT theme, COUNT(*) AS cnt, AVG(score) AS avg_score
+                FROM story_pool
+                GROUP BY theme
+                ORDER BY cnt DESC
+            """).fetchall()
+        ]
+
+        # 主题完播率飞轮快照
+        theme_performance = [
+            dict(r) for r in c.execute("""
+                SELECT theme, avg_watch, avg_likes, sample_count
+                FROM theme_performance
+                ORDER BY avg_watch DESC
+            """).fetchall()
+        ]
+
     return {
-        "total_stories": total,
-        "ready_stories": ready,
+        "total": total,
+        "ready": ready,
         "total_accounts": total_accounts,
-        "active_accounts": active_accounts
+        "active_accounts": active_accounts,
+        "by_theme": by_theme,
+        "theme_performance": theme_performance,
     }
+
+
+def update_production_stats(title_snippet: str, views: int, likes: int = 0, comments: int = 0, shares: int = 0) -> bool:
+    """RPA 网页抓取入口：按标题/文案片段模糊匹配生产记录，复用 update_performance 驱动飞轮。
+
+    网页端拿不到完播率，watch_rate 传 None（只更新点赞侧信号）。
+    """
+    with get_connection() as conn:
+        search_pattern = f"%{title_snippet}%"
+        row = conn.execute(
+            "SELECT id FROM production_history "
+            "WHERE cover_title LIKE ? OR viral_script LIKE ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (search_pattern, search_pattern),
+        ).fetchone()
+
+    if not row:
+        return False
+
+    update_performance(
+        production_id=row["id"],
+        views=views, likes=likes, comments=comments, shares=shares,
+        watch_rate=None,
+    )
+    return True
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     init_db()
     print(get_stats())
-
-def update_production_stats(title_snippet: str, views: int, likes: int = 0, comments: int = 0, shares: int = 0) -> bool:
-    """根据视频标题或文案片段更新播放量和互动数据（支持模糊匹配）"""
-    with get_connection() as conn:
-        c = conn.cursor()
-        search_pattern = f"%{title_snippet}%"
-        c.execute("SELECT id FROM production_history WHERE cover_title LIKE ? OR viral_script LIKE ? ORDER BY created_at DESC LIMIT 1", (search_pattern, search_pattern))
-        row = c.fetchone()
-        
-        if row:
-            prod_id = row[0]
-            c.execute('''
-                UPDATE production_history 
-                SET views = ?, likes = ?, comments = ?, shares = ? 
-                WHERE id = ?
-            ''', (views, likes, comments, shares, prod_id))
-            conn.commit()
-            return True
-        return False

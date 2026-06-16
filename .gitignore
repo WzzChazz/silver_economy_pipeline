@@ -3,11 +3,15 @@ __pycache__/
 *$py.class
 .env
 .env.*
-! .env.example
+!.env.example
 output/
 data/
 storage/
 assets/
+logs/
+scratch/
+.DS_Store
+debug_channels.*
 *.mp3
 *.mp4
 *.wav

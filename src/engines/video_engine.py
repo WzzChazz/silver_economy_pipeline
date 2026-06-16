@@ -21,10 +21,10 @@ import time
 from typing import Optional
 
 import edge_tts
-import httpx
 from dotenv import load_dotenv
 
 from src.core import database
+from src.core.llm import call_llm
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -38,109 +38,99 @@ FONT_PATH  = os.getenv("FONT_PATH", "Arial-Unicode-MS")
 
 for d in [ASSETS_DIR, OUTPUT_DIR, BROLLS_DIR, BGMS_DIR]:
     os.makedirs(d, exist_ok=True)
-for t in ["父母爱情", "老伴故事", "空巢", "养老现实"]:
+for t in ["父母爱情", "金婚岁月", "年代记忆", "儿女孝心"]:
     os.makedirs(os.path.join(BROLLS_DIR, t), exist_ok=True)
 
-SERIES_NAMES = ["《晚年心语》", "《人生下半场》", "《退休以后》", "《老来伴》", "《岁月如歌》"]
+SERIES_NAMES = ["《老照片里的爱情》", "《爸妈年轻时》", "《时光纪念册》", "《老来伴》", "《岁月如歌》"]
 
 
-# ============================================================
-# LLM 调用（文案改写 + 评论钩子）
-# ============================================================
-def _call_llm(prompt: str, temperature: float = 0.85) -> Optional[dict]:
-    cfg = {
-        "api_key":  os.getenv("SCRIPT_API_KEY", ""),
-        "base_url": os.getenv("SCRIPT_BASE_URL", "https://api.openai.com/v1"),
-        "model":    os.getenv("SCRIPT_MODEL",    "gpt-4o-mini"),
-    }
-    url = f"{cfg['base_url']}/chat/completions"
-    payload = {
-        "model": cfg["model"],
-        "messages": [
-            {"role": "system", "content": "You are a helpful assistant that outputs valid JSON."},
-            {"role": "user",   "content": prompt},
-        ],
-        "temperature": temperature,
-    }
-    headers = {
-        "Content-Type":  "application/json",
-        "Authorization": f"Bearer {cfg['api_key']}",
-    }
-    for attempt in range(3):
-        try:
-            with httpx.Client(timeout=60) as client:
-                resp = client.post(url, json=payload, headers=headers)
-                resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-            content = content.replace("```json", "").replace("```", "").strip()
-            return json.loads(content)
-        except Exception as e:
-            wait = 5 * (2 ** attempt)
-            logger.warning(f"LLM 调用失败（{attempt+1}/3）：{e}，{wait}s 后重试")
-            time.sleep(wait)
-    return None
+def _account_identity(account: dict = None, persona: str = "退休老人") -> dict:
+    """按账号稳定派生 旁白性别 / 系列名 / 集数，保证同一账号人设、音色、系列连续不变。
+
+    - 无 account（兜底）时给默认值。
+    - gender/series 用 account_id 做稳定哈希，避免每条视频乱跳。
+    - episode 用 account_matrix.post_count + 1（produce 流程每条后会自增）。
+    """
+    import hashlib
+    if not account:
+        return {"narrator_gender": "female", "series_title": SERIES_NAMES[0], "episode": None}
+
+    seed = int(hashlib.md5(account["account_id"].encode()).hexdigest(), 16)
+    gender = "female" if seed % 2 == 0 else "male"
+    series = SERIES_NAMES[seed % len(SERIES_NAMES)]
+    episode = (account.get("post_count") or 0) + 1
+    return {"narrator_gender": gender, "series_title": series, "episode": episode}
 
 
 # ============================================================
 # 文案生成（五段式脚本 + A/B 封面 + 评论钩子）
 # ============================================================
 _SCRIPT_PROMPT = """
-你是专注微信视频号银发市场（50-75岁）的顶级操盘手。
-你的核心任务是：深入剖析历史高播放量视频的成功密码（如情绪共鸣、互动钩子、安全感诉求等），将这些底层逻辑提炼出来，应用到新的创作中，而不是生硬地照抄原句。
+你是专注微信视频号「中老年家庭情感」赛道的顶级操盘手。
+核心目标只有一个：让这条视频能被中老年用户【转发到家族群/朋友圈】，并引导有需求的子女私信做纪念视频。
+请提炼历史高播放样本的底层逻辑（情绪共鸣、转发动机、安全感），应用到新创作，而不是照抄原句。
 
-请根据“真实市场反馈规律”，将这段【真实高赞老人故事】改写为爆款短视频脚本：
+请把这段【真实高赞素材】改写为一条 30~45 秒的爆款短视频口播脚本：
 "{story}"
 
-人设 IP："{persona}"
-主题：{theme}
+人设 IP："{persona}"（固定旁白，性别已定：{narrator_gender}，全程保持一致，不得更改）
+主题方向：{theme}
 当前日期：{current_date}
 
-【防侵权与隐私洗稿要求】（非常重要）
-必须对原故事的核心时间线、具体地名、真实姓名、人物具体职业等设定进行二次艺术加工和打乱，彻底规避洗稿和侵权风险。只保留最核心的情感情绪共鸣点。
+【防侵权洗稿】必须打乱原故事的时间线、地名、姓名、职业等设定做二次艺术加工，只保留核心情绪共鸣点。
 
-【脚本写作与情绪控制】
-1. 第一人称，"{persona}"视角，保持“温和、有阅历、说大白话的中老年叙述者”腔调。
-2. 五段式：开头钩子→中间共鸣→痛点升华→总结→互动话术。
-3. 【强制要求：具体场景锚点】开头钩子必须包含一个具体的物件、地点或时间（例如：“那天翻出年轻时的旧大衣”、“昨晚给儿子打了个电话，没说两句就挂了”），绝对不能是抽象说理（不能说“人到晚年才明白”）。
-【禁忌警告】：绝对不能使用“去了趟医院才明白/看透”这种已被严重用烂、容易被平台限流的陈词滥调！
-4. 【差异化叙事腔调】请根据当前故事内容，自然适配以下四种方向之一的腔调：
-   - 父母爱情：要有年代感，多提老物件（如旧毛衣、老照片），语气充满怀念与温情。
-   - 老伴故事：要有岁月沉淀感，多描写琐碎日常（如一碗热面、起夜倒水），语气平实但深情。
-   - 空巢老人：要突出空间对比和孤独感（如空荡的客厅、变冷的饭菜），语气略带落寞但不失释然。
-   - 养老现实：直击痛点，具体到看病排队、带孙子的疲惫，语气要有一种看透世故后的通透与自得。
-5. 所有断句用 \\n（每行不超过 10 字，行数足够撑 40 秒）。
+【硬性长度要求——最重要】
+1. 口播正文总字数严格控制在 110~150 字之间（约 30~45 秒），宁短勿长。视频太长完播率必死。
+2. 用 \\n 断句，每行不超过 10 字，总行数 8~12 行。
 
-【封面钩子要求】
-生成 3 个封面钩子版本（cover_a/b/c），各 8 字内，分两行用 \\n。必须从以下 8 种类型中选择 3 种不同的类型：
-1.年龄倒计时型（如：65岁以后才明白） 2.反问触痛型（如：你有没有想过） 3.场景代入型（如：去了一趟医院）
-4.对比冲突型（如：年轻时拼命，老了发现） 5.身份认同型（如：退休老人才懂） 6.结论前置型（如：最后悔的不是穷）
-7.悬念留白型（如：那天没忍住哭了） 8.数字具体型（如：70岁的3个秘密）
+【完播率命门：前 3 秒钩子】
+开头第一句（前 2 行）必须是一个【具体的画面/物件/动作】瞬间抓人，且制造悬念或情绪冲击。
+例：“翻出妈妈年轻时的照片”“爸结婚那天就拍过一张”。
+绝对禁止抽象说理开头（不能用“人到晚年才明白”）。
+【限流红线】绝对禁止两类内容：
+1. 医院/看病/生病/卖惨/独居孤独/老伴去世/“去了趟医院才明白”——负向、易限流、无转发基因。
+2. 死亡紧迫感/晦气措辞：“趁父母还在/趁还来得及/再不做就来不及/子欲养而亲不待”——会被举报、抑制转发。
+孝心一律用【惊喜 / 陪伴 / 感恩 / 节日】正向框架表达（如“给爸妈一个惊喜”“他们看了特别开心”），而非“怕失去”。
 
-【评论区置顶文案】
-生成评论区置顶文案（comment_hook）：结合当前日期/节气/季节，动态生成互动话术（可引导留言、转发特定人群、保存等，避免单一的"留个健康"），第一人称，带情感共鸣，不超过 40 字。
+【转发基因——决定能不能起量】
+内容必须让中老年人“想转给家人”。优先走以下正向、温暖、有年代感的方向（按主题适配腔调）：
+   - 父母爱情：年代感，老物件（旧照片、旧毛衣、搪瓷缸），怀念温情。
+   - 金婚岁月：相守一生的细节（一碗热面、起夜倒水），平实深情。
+   - 年代记忆：那个年代的集体回忆（粮票、老挂历、黑白婚纱照），唤起共鸣。
+   - 儿女孝心：子女视角的愧疚与陪伴（常年在外、给爸妈做点什么），引发“该多陪陪父母”的共鸣。
 
-【画面描述词】
-生成一句画面描述词（image_prompt）：基于当前故事核心场景，提炼一句 20 字以内的高清画面描述词用于 AI 绘图。
-注意：
-1. 必须具有中国老人的面貌特征，符合中国年代感和生活气息。
-2. 人物动作必须与剧情物件强相关（例如剧情提到账本，画面必须是老人在看手写的中文账本，而不是看其他地方）。
-【重要】：根据你设定的 narrator_gender，如果是 male，画面描述词中必须明确写“中国老爷爷”；如果是 female，必须明确写“中国老奶奶”。
-3. 若画面中出现文字物件（如病历本、日记、账本等），必须强调上面是“中文手写体”。
-示例：一个满头白发的中国老奶奶，正在低头看着手里泛黄的中文手写账本，神情落寞，写实风格。
+【结尾：只放转发钩子，不要在口播里导流（很重要）】
+viral_text 最后 1~2 行只写一句“转发动机”话术，引导【站内转发】——这是起量命脉且平台安全。
+口播正文【绝对不要】出现“主页找我/私信我/加微信”等导流词（口播里喊导流=营销号，会限流且没人转）。
+转发钩子按 narrator_gender 适配视角：
+   - 老人视角（male/female 老人自述）：引导老人把内容递给子女，如“家里有老照片的，转给孩子看看”。
+   - 子女视角（儿女孝心类）：引导转给家人，如“有同感的，转给你的兄弟姐妹”。
 
-参考以下历史爆款文案风格（Few-shot 示例）：
+【封面钩子】生成 3 版（cover_a/b/c），各 8 字内、分两行用 \\n，从以下选 3 种不同类型：
+1.年龄型 2.反问型 3.场景代入型 4.对比冲突型 5.身份认同型 6.结论前置型 7.悬念留白型 8.数字具体型。
+
+【评论区置顶文案 comment_hook】（软引流下沉到这里，比口播安全，只有感兴趣的人看）
+结合日期/季节/节日，第一人称带情感，先引导互动（“评论区说说你和爸妈的故事”），
+再轻轻带一句软引流（如“好多人问怎么做的，整理在主页了”），不得用“扣1/加微信”，不超过 40 字。
+
+【画面描述词 image_prompt】一句 20 字内高清画面描述词用于 AI 绘图：
+- 必须是中国老人面貌、有年代感与生活气息；动作与剧情物件强相关。
+- 按 narrator_gender：male 写“中国老爷爷”，female 写“中国老奶奶”。
+- 若出现文字物件（旧信、账本）须注明“中文手写体”。
+示例：一位满头白发的中国老奶奶，捧着泛黄的黑白结婚照，神情温柔，写实风格。
+
+参考历史爆款风格（Few-shot）：
 {few_shot_examples}
 
-输出严格 JSON：
+输出严格 JSON（不含多余文字）：
 {{
-    "learning_analysis": "（内部复盘）深刻剖析高播放量样本成功的原因，并说明本次新剧本如何巧妙吸收其底层心理逻辑（例如：痛点是如何设计的？互动诱饵是怎么抛的？）",
-    "narrator_gender": "male 或者 female（大模型根据故事的主人公视角自行决定，并在后续生成中保持一致）",
-    "viral_text": "正文，\\n 断句",
+    "learning_analysis": "（内部复盘）本条如何设计转发动机和前3秒钩子",
+    "viral_text": "正文 110~150字，\\n 断句，结尾只含转发钩子（不要导流词）",
     "image_prompt": "画面描述词",
     "cover_a": "类型X\\n封面",
     "cover_b": "类型Y\\n封面",
     "cover_c": "类型Z\\n封面",
-    "comment_hook": "动态评论区置顶文案"
+    "comment_hook": "评论区置顶文案"
 }}
 """
 
@@ -166,7 +156,13 @@ def generate_viral_script(account: dict = None) -> Optional[dict]:
     theme     = story_record["theme"]
     chosen_persona = story_record.get("persona") or persona or "退休老人"
 
-    logger.info(f"拉取故事 ID={story_id} score={story_record['score']} persona={chosen_persona}")
+    # 账号绑定的稳定身份（性别/系列/集数），避免人设乱跳
+    identity = _account_identity(account, chosen_persona)
+
+    logger.info(
+        f"拉取故事 ID={story_id} score={story_record['score']} persona={chosen_persona} "
+        f"性别={identity['narrator_gender']} 系列={identity['series_title']} 第{identity['episode']}期"
+    )
 
     from datetime import datetime
     current_date = datetime.now().strftime("%Y-%m-%d %A")
@@ -179,43 +175,56 @@ def generate_viral_script(account: dict = None) -> Optional[dict]:
     else:
         few_shot_examples = "暂无历史数据，请自由发挥。"
 
-    result = _call_llm(_SCRIPT_PROMPT.format(
+    result = call_llm(_SCRIPT_PROMPT.format(
         story=raw_story,
         persona=chosen_persona,
+        narrator_gender=identity["narrator_gender"],
         theme=theme,
         current_date=current_date,
         few_shot_examples=few_shot_examples,
-    ), temperature=0.85)
+    ), system="You are a helpful assistant that outputs valid JSON.",
+       temperature=0.85, prefer="script")
 
     if not result:
         logger.warning("文案生成失败，使用兜底文案")
-        return _fallback_script(story_id=story_id, theme=theme)
+        return _fallback_script(story_id=story_id, theme=theme, identity=identity)
+
+    # 集数后缀让系列可“追更”
+    series_title = identity["series_title"]
+    if identity["episode"]:
+        series_title = f"{series_title} 第{identity['episode']}期"
 
     result.update({
-        "story_id":     story_id,
-        "theme":        theme,
-        "scene":        story_record.get("scene", "general"),
-        "persona":      chosen_persona,
-        "series_title": random.choice(SERIES_NAMES),
+        "story_id":        story_id,
+        "theme":           theme,
+        "scene":           story_record.get("scene", "general"),
+        "persona":         chosen_persona,
+        "narrator_gender": identity["narrator_gender"],
+        "series_title":    series_title,
     })
     return result
 
 
-def _fallback_script(story_id=None, theme="health") -> dict:
+def _fallback_script(story_id=None, theme="父母爱情", identity=None) -> dict:
+    """兜底文案：走转发型「父母爱情/老照片」方向，结尾含转发钩子 + 软引流。"""
+    identity = identity or _account_identity(None)
+    series_title = identity["series_title"]
+    if identity.get("episode"):
+        series_title = f"{series_title} 第{identity['episode']}期"
     return {
         "story_id":    story_id,
         "theme":       theme,
         "scene":       "home",
         "persona":     "退休老人",
-        "learning_analysis": "基于健康主题的兜底生成，以高血压案例提醒同龄人关注身体。",
-        "narrator_gender": "male",
-        "series_title": random.choice(SERIES_NAMES),
-        "viral_text":  "今天收拾屋子\n翻出了老伴十年前的旧大衣\n口袋里还装着\n当年给我买药的发票\n人到了这个年纪啊\n才彻底看透\n儿女再孝顺\n也代替不了那份朝夕相伴\n老伴在\n家就在\n老伴在\n心就安\n认同的朋友\n点个红心\n祝天下老夫老妻\n都能互相陪伴到老",
-        "image_prompt": "一位满头白发的中国老爷爷，正在用老式血压计给自己量血压，眉头微皱，神情专注，写实风格。",
-        "cover_a":     "今天收拾屋子\n才彻底看透",
-        "cover_b":     "人到晚年\n最大的依靠是谁",
-        "cover_c":     "老伴在\n家就在",
-        "comment_hook": "岁月不饶人，老伴才是陪你走到最后的人。认同的留个赞🙏",
+        "learning_analysis": "兜底：老照片+父母爱情，靠年代感共鸣驱动转发，结尾软引流私域代做。",
+        "narrator_gender": identity["narrator_gender"],
+        "series_title": series_title,
+        "viral_text":  "翻出爸妈年轻时\n那张黑白照片\n那个年代没有婚纱\n一件的确良衬衫\n就是最好的体面\n他们没说过爱\n却把一辈子\n过成了情话\n这样的老照片\n配上音乐\n爸妈看了\n准乐开花\n家里有老照片的\n转给孩子看看",
+        "image_prompt": "一对中国老夫妻捧着泛黄的黑白结婚照，神情温柔怀念，年代感，写实风格。",
+        "cover_a":     "爸妈年轻时\n有多好看",
+        "cover_b":     "那个年代\n的爱情",
+        "cover_c":     "黑白照片\n藏着情话",
+        "comment_hook": "你还留着爸妈年轻时的照片吗？评论区聊聊，想做同款的主页有教程❤️",
     }
 
 
@@ -242,9 +251,13 @@ async def generate_audio(text: str, output_path: str, gender: str = "male"):
 # ============================================================
 # Whisper 字幕时间戳（升级 small 模型）
 # ============================================================
-def get_whisper_timestamps(audio_path: str, text: str) -> list[dict]:
-    logger.info("Whisper small 字幕对齐中...")
-    try:
+_whisper_model = None  # 模型缓存：批量生产时只加载一次
+
+
+def _get_whisper_model():
+    """懒加载并缓存 Whisper small 模型，避免每条视频重复加载。"""
+    global _whisper_model
+    if _whisper_model is None:
         import whisper
         import imageio_ffmpeg
         import numpy as np
@@ -259,7 +272,15 @@ def get_whisper_timestamps(audio_path: str, text: str) -> list[dict]:
             return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
 
         whisper.audio.load_audio = _load_audio
-        model = whisper.load_model("small")
+        _whisper_model = whisper.load_model("small")
+        logger.info("Whisper small 模型加载完成（已缓存）")
+    return _whisper_model
+
+
+def get_whisper_timestamps(audio_path: str, text: str) -> list[dict]:
+    logger.info("Whisper small 字幕对齐中...")
+    try:
+        model = _get_whisper_model()
         result = model.transcribe(audio_path, fp16=False, language="zh", word_timestamps=True)
     except Exception as e:
         logger.warning(f"Whisper 加载或执行失败：{e}。若资源有限建议更换为 API 版本或 whisper.cpp，当前退回均匀分配时间戳")
@@ -308,7 +329,6 @@ def get_whisper_timestamps(audio_path: str, text: str) -> list[dict]:
 
 def _uniform_timestamps(audio_path: str, text: str) -> list[dict]:
     """Whisper 降级：均匀分配时间戳"""
-    import subprocess
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
@@ -462,7 +482,6 @@ def create_video(
             mixed_audio = audio_path
 
         # 视频合成动态反同质化滤镜
-        import random
         hflip = "hflip," if random.random() > 0.5 else ""
         brightness = random.uniform(-0.05, 0.05)
         saturation = random.uniform(0.9, 1.1)
