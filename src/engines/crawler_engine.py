@@ -25,19 +25,22 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-PROFILE_DIR = os.path.join(BASE_DIR, "data", "browser_profile")
+# 与 channels_rpa 共用同一浏览器 profile（统一登录态，二者不并发运行）
+PROFILE_DIR = os.path.join(BASE_DIR, "storage", "browser_profile")
 os.makedirs(PROFILE_DIR, exist_ok=True)
 
 # ---------- 采集参数 ----------
+# 选题方向：转发型「中老年家庭情感」（父母爱情 / 金婚岁月 / 年代记忆 / 儿女孝心）
+# 刻意避开 卖惨/独居/疾病/去世 等限流且无转发基因的方向
 KEYWORDS = [
-    "退休后最大的感受",
-    "人老了最怕什么",
-    "晚年独居是什么感受",
-    "老伴去世之后",
-    "空巢老人的真实生活",
-    "60岁以后才明白",
-    "父母老了我才懂",
-    "一个人住的老人",
+    "父母年轻时的照片",
+    "爸妈那个年代的爱情",
+    "父母结婚时的故事",
+    "金婚老两口的日常",
+    "那个年代的婚纱照",
+    "翻出爸妈的老照片",
+    "父母年轻时有多好看",
+    "陪父母变老的瞬间",
 ]
 
 # 随机 UA 池
@@ -69,16 +72,11 @@ def _browser_args(proxy: str = None) -> dict:
 # ============================================================
 # 知乎采集
 # ============================================================
-def _fetch_zhihu(keyword: str, limit: int = 5) -> list[str]:
+def _fetch_zhihu(ctx, keyword: str, limit: int = 5) -> list[str]:
     logger.info(f"[知乎] 开始采集关键词：{keyword}")
-    proxies = _get_proxies()
-    proxy = random.choice(proxies) if proxies else None
     stories = []
-
-    with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(**_browser_args(proxy))
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-
+    page = ctx.new_page()
+    try:
         # 随机鼠标移动，模拟真人
         page.mouse.move(random.randint(100, 600), random.randint(100, 400))
 
@@ -104,8 +102,8 @@ def _fetch_zhihu(keyword: str, limit: int = 5) -> list[str]:
             text = ans.inner_text().strip()
             if 100 < len(text) < 2000:
                 stories.append(text)
-
-        ctx.close()
+    finally:
+        page.close()
 
     logger.info(f"[知乎] 采集完成，有效 {len(stories)} 条")
     return stories
@@ -114,16 +112,11 @@ def _fetch_zhihu(keyword: str, limit: int = 5) -> list[str]:
 # ============================================================
 # 小红书采集
 # ============================================================
-def _fetch_xiaohongshu(keyword: str, limit: int = 5) -> list[str]:
+def _fetch_xiaohongshu(ctx, keyword: str, limit: int = 5) -> list[str]:
     logger.info(f"[小红书] 开始采集关键词：{keyword}")
-    proxies = _get_proxies()
-    proxy = random.choice(proxies) if proxies else None
     stories = []
-
-    with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(**_browser_args(proxy))
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-
+    page = ctx.new_page()
+    try:
         encoded = urllib.parse.quote(keyword)
         page.goto(f"https://www.xiaohongshu.com/search_result?keyword={encoded}&source=web_search_result_notes")
 
@@ -131,7 +124,6 @@ def _fetch_xiaohongshu(keyword: str, limit: int = 5) -> list[str]:
             page.wait_for_selector(".note-item", timeout=25000)
         except PlaywrightTimeout:
             logger.warning("[小红书] 页面加载超时（可能需要扫码）")
-            ctx.close()
             return stories
 
         for _ in range(3):
@@ -169,8 +161,8 @@ def _fetch_xiaohongshu(keyword: str, limit: int = 5) -> list[str]:
             except Exception as e:
                 logger.warning(f"[小红书] 详情页打开失败：{e}")
                 continue
-
-        ctx.close()
+    finally:
+        page.close()
 
     logger.info(f"[小红书] 采集完成，有效 {len(stories)} 条")
     return stories
@@ -179,16 +171,11 @@ def _fetch_xiaohongshu(keyword: str, limit: int = 5) -> list[str]:
 # ============================================================
 # 微信公众号采集（通过搜狗微信搜索）
 # ============================================================
-def _fetch_weixin(keyword: str, limit: int = 5) -> list[str]:
+def _fetch_weixin(ctx, keyword: str, limit: int = 5) -> list[str]:
     logger.info(f"[微信公众号] 开始采集关键词：{keyword}")
-    proxies = _get_proxies()
-    proxy = random.choice(proxies) if proxies else None
     stories = []
-
-    with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(**_browser_args(proxy))
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-
+    page = ctx.new_page()
+    try:
         encoded = urllib.parse.quote(keyword)
         page.goto(f"https://weixin.sogou.com/weixin?type=2&query={encoded}&ie=utf8")
 
@@ -196,7 +183,6 @@ def _fetch_weixin(keyword: str, limit: int = 5) -> list[str]:
             page.wait_for_selector(".news-list", timeout=20000)
         except PlaywrightTimeout:
             logger.warning("[微信] 搜狗页面加载超时")
-            ctx.close()
             return stories
 
         article_links = page.query_selector_all(".news-list li .txt-box a")
@@ -229,8 +215,8 @@ def _fetch_weixin(keyword: str, limit: int = 5) -> list[str]:
             except Exception as e:
                 logger.warning(f"[微信] 文章打开失败：{e}")
                 continue
-
-        ctx.close()
+    finally:
+        page.close()
 
     logger.info(f"[微信] 采集完成，有效 {len(stories)} 条")
     return stories
@@ -250,7 +236,11 @@ def run_daily_crawl(
     channels: list[str] = None,
     limit_per_kw: int = 3,
 ):
-    """主采集任务，供调度器和手动调用"""
+    """主采集任务，供调度器和手动调用。
+
+    每个渠道只启动一次浏览器，复用同一 context 跑完所有关键词，
+    避免按「关键词×渠道」反复冷启动 Chromium。
+    """
     if keywords is None:
         keywords = KEYWORDS
     if channels is None:
@@ -258,24 +248,36 @@ def run_daily_crawl(
 
     logger.info(f"日常采集任务启动：{len(keywords)} 个关键词 × {len(channels)} 个渠道")
     total_evaluated = 0
+    proxies = _get_proxies()
 
-    for kw in keywords:
-        for ch in channels:
-            fetch_fn = CHANNEL_MAP.get(ch)
-            if not fetch_fn:
-                continue
-            logger.info(f"{'='*50}\n渠道={ch} 关键词={kw}")
-            try:
-                texts = fetch_fn(kw, limit=limit_per_kw)
-            except Exception as e:
-                logger.error(f"渠道 {ch} 采集异常：{e}")
-                continue
+    for ch in channels:
+        fetch_fn = CHANNEL_MAP.get(ch)
+        if not fetch_fn:
+            continue
 
-            for text in texts:
-                logger.info(f"送审内容（字数={len(text)}）")
-                story_engine.evaluate_story(text, source=f"{ch}_{kw}")
-                total_evaluated += 1
-                time.sleep(random.uniform(1.5, 3.0))
+        proxy = random.choice(proxies) if proxies else None
+        try:
+            with sync_playwright() as p:
+                ctx = p.chromium.launch_persistent_context(**_browser_args(proxy))
+                try:
+                    for kw in keywords:
+                        logger.info(f"{'='*50}\n渠道={ch} 关键词={kw}")
+                        try:
+                            texts = fetch_fn(ctx, kw, limit=limit_per_kw)
+                        except Exception as e:
+                            logger.error(f"渠道 {ch} 关键词 {kw} 采集异常：{e}")
+                            continue
+
+                        for text in texts:
+                            logger.info(f"送审内容（字数={len(text)}）")
+                            story_engine.evaluate_story(text, source=f"{ch}_{kw}")
+                            total_evaluated += 1
+                            time.sleep(random.uniform(1.5, 3.0))
+                finally:
+                    ctx.close()
+        except Exception as e:
+            logger.error(f"渠道 {ch} 浏览器启动失败：{e}")
+            continue
 
     logger.info(f"日常采集完成，共送审 {total_evaluated} 条")
 

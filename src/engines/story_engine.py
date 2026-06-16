@@ -8,84 +8,17 @@ story_engine.py  —  故事评分与入库引擎
   4. 标题党 / 低质内容预过滤
 """
 
-import os
-import json
 import logging
 import time
 from typing import Optional
 
-import httpx
 from dotenv import load_dotenv
 
 from src.core import database
+from src.core.llm import call_llm
 
 load_dotenv()
 logger = logging.getLogger(__name__)
-
-# ---------- API 配置 ----------
-def _get_llm_config(prefer: str = "deepseek") -> dict:
-    """优先用 DeepSeek 评分（便宜），兜底用 Script LLM"""
-    primary = {
-        "api_key":  os.getenv("DEEPSEEK_API_KEY", ""),
-        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
-        "model":    os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
-    }
-    fallback = {
-        "api_key":  os.getenv("SCRIPT_API_KEY", ""),
-        "base_url": os.getenv("SCRIPT_BASE_URL", "https://api.openai.com/v1"),
-        "model":    os.getenv("SCRIPT_MODEL", "gpt-4o-mini"),
-    }
-    cfg = primary if prefer == "deepseek" else fallback
-    if not cfg["api_key"] or "your-" in cfg["api_key"]:
-        logger.warning(f"{prefer} API Key 未配置，切换到备用")
-        cfg = fallback
-    return cfg
-
-
-# ---------- 带重试的 LLM 调用 ----------
-def _call_llm(
-    prompt: str,
-    system: str = "You output only valid JSON.",
-    temperature: float = 0.3,
-    prefer: str = "deepseek",
-    max_retries: int = 3,
-) -> Optional[dict]:
-    cfg = _get_llm_config(prefer)
-    url = f"{cfg['base_url']}/chat/completions"
-    payload = {
-        "model": cfg["model"],
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": prompt},
-        ],
-        "temperature": temperature,
-    }
-    headers = {
-        "Content-Type":  "application/json",
-        "Authorization": f"Bearer {cfg['api_key']}",
-    }
-
-    for attempt in range(max_retries):
-        try:
-            with httpx.Client(timeout=60) as client:
-                resp = client.post(url, json=payload, headers=headers)
-                resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-            content = content.replace("```json", "").replace("```", "").strip()
-            return json.loads(content)
-        except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
-            wait = 2 ** attempt
-            logger.warning(f"LLM 调用失败（第 {attempt+1} 次）：{e}，{wait}s 后重试")
-            time.sleep(wait)
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON 解析失败：{e}")
-            return None
-
-    # 所有重试耗尽，尝试切换备用 API
-    if prefer == "deepseek":
-        logger.warning("DeepSeek 重试耗尽，切换 Script LLM")
-        return _call_llm(prompt, system, temperature, prefer="script", max_retries=2)
-    return None
 
 
 # ---------- 预过滤：拦截低质内容 ----------
@@ -108,30 +41,32 @@ def _is_spam(text: str) -> bool:
 
 # ---------- 五维评分提示词 ----------
 _SCORE_PROMPT = """
-你是专注 50-75 岁银发群体情感内容的资深选题编辑。
-请对下面这段原始素材进行严格的多维度评分，总分 100 分（五维各 20 分满分）。
+你是专注「中老年家庭情感」赛道（视频号）的资深选题编辑。
+目标是筛出【能被中老年人转发到家族群/朋友圈】、且能引向「老照片纪念视频」需求的正向温暖素材。
+请对下面这段原始素材严格多维评分，总分 100 分（五维各 20 分满分）。
 
 原始素材：
 {story}
 
 评分维度说明（每项 0-20 分）：
-1. score_pain（痛点强度）：是否触及老年人核心痛点（老伴、儿女、孤独、健康、被遗忘感）
-2. score_truth（真实性）：细节是否具体真实，有无生活气息，能否让人相信"这是真人经历"
-3. score_resonance（共鸣面）：有多少比例的 50-75 岁老人能产生"说的就是我"的感觉
-4. score_freshness（新鲜度）：故事角度是否独特，区别于"正能量鸡汤"套路
-5. score_rewrite（改写潜力）：能否提炼出有力金句，改写后是否具有短视频爆款潜力
+1. score_pain（情绪/转发驱动力）：情绪是否强到让人“想转给家人”（父母爱情、年代回忆、孝心触动）。
+2. score_truth（真实性）：细节是否具体真实，有生活气息，像真人经历。
+3. score_resonance（共鸣面）：多少比例的中老年/其子女会“说的就是我家”。
+4. score_freshness（新鲜度/非套路）：是否区别于“正能量鸡汤”，有具体年代/物件锚点。
+5. score_rewrite（改写潜力）：能否提炼金句，改写成 30-45 秒短视频爆款。
+
+【限流红线·必须严判】若素材主体是 疾病/医院/看病/卖惨/独居孤独/老伴去世 等负向限流方向，
+则 score_pain 与 score_freshness 直接给 ≤8 分（这类无转发基因、易限流，不要它）。
 
 同时请判断故事属于以下哪一种【12大叙事原型】（严格选一）：
-1. 失去型（老伴离世、搬离老屋） 2. 顿悟型（一件小事改变了看法） 3. 和解型（与子女/过去和好） 
-4. 对比型（年轻时 vs 现在） 5. 发现型（老了才发现什么事情是对的） 6. 逆转型（以为是坏事却是好事）
-7. 觉醒型（开始为自己而活） 8. 遗憾型（错过的人或事） 9. 释怀型（看开生死或财富）
-10. 代沟型（与年轻人的观念冲突） 11. 羁绊型（老友/宠物/老物件的陪伴） 12. 告别型（面对衰老或疾病的体面）
+1. 失去型 2. 顿悟型 3. 和解型 4. 对比型（年轻时 vs 现在） 5. 发现型 6. 逆转型
+7. 觉醒型 8. 遗憾型 9. 释怀型 10. 代沟型 11. 羁绊型（老友/老物件的陪伴） 12. 告别型
 
 同时归类以下字段：
-- theme：必须严格从以下 4 个方向中选一（父母爱情 / 老伴故事 / 空巢 / 养老现实）
-- emotion：两个字的情感总结（如：心酸、通透、感动）
-- scene：故事核心场景（英文，如：hospital, home, park）
-- persona：四字人物画像（如：独居老人、退休教师）
+- theme：必须严格从以下 4 个方向中选一（父母爱情 / 金婚岁月 / 年代记忆 / 儿女孝心）
+- emotion：两个字的情感总结（如：温情、怀念、感动）
+- scene：故事核心场景（英文，如：home, wedding, park）
+- persona：四字人物画像（如：恩爱老伴、慈祥母亲）
 - reason：打分关键理由（一句话）
 
 必须输出严格 JSON，不含任何多余文字：
@@ -162,7 +97,7 @@ def evaluate_story(raw_story: str, source: str = "unknown") -> Optional[dict]:
         return None
 
     logger.info(f"开始 AI 五维评分（来源：{source}，字数：{len(raw_story)}）")
-    result = _call_llm(_SCORE_PROMPT.format(story=raw_story), temperature=0.3)
+    result = call_llm(_SCORE_PROMPT.format(story=raw_story), temperature=0.3, prefer="deepseek")
     if not result:
         logger.error("评分失败，跳过")
         return None

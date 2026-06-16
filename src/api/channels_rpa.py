@@ -64,20 +64,21 @@ def run_channels_rpa():
             logger.warning("未检测到标准的已知列表元素，将尝试通过模糊探测抓取。")
             
         time.sleep(5) # 确保网络请求数据渲染完毕
-        
-        # [DEBUG] 打印并保存页面源码以供分析
-        try:
-            debug_html_path = os.path.join(base_dir, "debug_channels.html")
-            with open(debug_html_path, "w", encoding="utf-8") as f:
-                f.write(page.content())
-            logger.info(f"已保存页面源码至 {debug_html_path}，用于针对性调试 DOM 结构")
-            # 同时保存截图
-            debug_png_path = os.path.join(base_dir, "debug_channels.png")
-            page.screenshot(path=debug_png_path, full_page=True)
-            logger.info(f"已保存页面截图至 {debug_png_path}")
-        except Exception as e:
-            logger.error(f"保存调试信息失败: {e}")
-        
+
+        # [DEBUG] 仅在 CHANNELS_RPA_DEBUG=1 时保存页面源码/截图，避免每次跑都落 240KB+ 文件
+        if os.getenv("CHANNELS_RPA_DEBUG") == "1":
+            try:
+                debug_html_path = os.path.join(base_dir, "debug_channels.html")
+                with open(debug_html_path, "w", encoding="utf-8") as f:
+                    f.write(page.content())
+                logger.info(f"已保存页面源码至 {debug_html_path}，用于针对性调试 DOM 结构")
+                # 同时保存截图
+                debug_png_path = os.path.join(base_dir, "debug_channels.png")
+                page.screenshot(path=debug_png_path, full_page=True)
+                logger.info(f"已保存页面截图至 {debug_png_path}")
+            except Exception as e:
+                logger.error(f"保存调试信息失败: {e}")
+
         # 3. 提取数据
         # 分析截图发现：微信视频号采用了 Wujie 微前端架构，数据渲染在 iframe 或 Shadow DOM 中
         # 我们遍历所有 frame 执行提取逻辑
