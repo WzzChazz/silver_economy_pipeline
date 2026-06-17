@@ -35,7 +35,28 @@ ASSETS_DIR = os.path.join(BASE_DIR, os.getenv("ASSETS_DIR", "assets"))
 OUTPUT_DIR = os.path.join(BASE_DIR, os.getenv("OUTPUT_DIR", "output"))
 BROLLS_DIR = os.path.join(ASSETS_DIR, "brolls")
 BGMS_DIR   = os.path.join(ASSETS_DIR, "bgms")
-FONT_PATH  = os.getenv("FONT_PATH", "Arial-Unicode-MS")
+FONT_PATH  = os.getenv("FONT_PATH", "Arial-Unicode-MS")  # 字体「名」，给 ASS/libass 用
+
+
+def _resolve_font_file() -> str:
+    """解析一个真实存在的中文字体「文件路径」给 FFmpeg drawtext(封面)用。
+    drawtext 的 fontfile= 必须是文件路径,不能是字体名,否则中文渲染成豆腐块。"""
+    for c in [
+        os.getenv("FONT_FILE", ""),
+        "/Library/Fonts/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",       # Linux 常见中文字体
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ]:
+        if c and os.path.exists(c):
+            return c
+    logger.warning("未找到中文字体文件，封面文字可能渲染异常；可在 .env 设 FONT_FILE 指向 .ttf/.ttc")
+    return FONT_PATH
+
+
+FONT_FILE = _resolve_font_file()  # 字体「文件」，给 drawtext 用
 
 # ffmpeg/ffprobe：优先用 .env 指定，其次项目内 bin/（静态二进制，绕过系统未装 ffmpeg），最后回退 PATH
 _LOCAL_FFMPEG  = os.path.join(BASE_DIR, "bin", "ffmpeg")
@@ -966,11 +987,11 @@ def generate_cover(
     input_args = ["-i", bg_source] if is_video else ["-loop", "1", "-t", "1", "-i", bg_source]
 
     drawtext = (
-        f"drawtext=fontfile={FONT_PATH}:fontsize=110:fontcolor=gold:bordercolor=black:borderw=5:"
+        f"drawtext=fontfile='{FONT_FILE}':fontsize=110:fontcolor=gold:bordercolor=black:borderw=5:"
         f"text='{title_line1}':x=(w-text_w)/2:y=h*0.28,"
-        f"drawtext=fontfile={FONT_PATH}:fontsize=110:fontcolor=gold:bordercolor=black:borderw=5:"
+        f"drawtext=fontfile='{FONT_FILE}':fontsize=110:fontcolor=gold:bordercolor=black:borderw=5:"
         f"text='{title_line2}':x=(w-text_w)/2:y=h*0.28+130,"
-        f"drawtext=fontfile={FONT_PATH}:fontsize=55:fontcolor=white:bordercolor=black:borderw=3:"
+        f"drawtext=fontfile='{FONT_FILE}':fontsize=55:fontcolor=white:bordercolor=black:borderw=3:"
         f"text='{series_title}':x=(w-text_w)/2:y=h*0.18,"
         "colormatrix=bt601:bt709"  # 暗角效果
     )
