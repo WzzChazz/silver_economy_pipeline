@@ -1,13 +1,18 @@
 """
 main.py  —  银发矩阵系统主入口
 用法：
-  python main.py crawl        # 立即采集一次（旧链路）
-  python main.py generate     # 生成唤起型素材入库（推荐，替代采集）
-  python main.py produce      # 生成一条视频（所有活跃账号）
-  python main.py report       # 输出选题效果报告
-  python main.py schedule     # 启动完整调度器（采集 + 数据回传）
-  python main.py health       # 查看故事库健康状态
-  python main.py setup        # 初始化数据库 + 添加示例账号
+  python main.py crawl          # 立即采集一次（旧链路）
+  python main.py generate       # 生成唤起型素材入库（推荐，替代采集）
+  python main.py fetch-assets [N] # 下载公共版权老物件图（物件年代记忆线，每类 N 张）
+  python main.py produce        # 生成一条视频（所有活跃账号）
+  python main.py report         # 输出选题效果报告
+  python main.py schedule       # 启动完整调度器（采集 + 数据回传）
+  python main.py health         # 查看故事库健康状态
+  python main.py setup          # 初始化数据库 + 添加示例账号
+
+内容模式（环境变量 CONTENT_MODE）：
+  photo （默认）老照片家庭情感线（第二阶段变现线，靠故事库）
+  object 老物件年代记忆线（第一阶段规模化养号线，配合 fetch-assets）
 """
 
 import asyncio
@@ -130,16 +135,25 @@ def cmd_scrape():
     run_channels_rpa()
 
 
+def cmd_fetch_assets():
+    """下载公共版权(PD/CC0)老物件图到 assets/brolls/年代记忆/（物件年代记忆线用）"""
+    from src.engines.assets_fetcher import fetch_image_assets
+    per = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+    total = fetch_image_assets(per_object=per)
+    print(f"✅ 共新增 {total} 张老物件素材")
+
+
 COMMANDS = {
-    "setup":    cmd_setup,
-    "crawl":    cmd_crawl,
-    "generate": cmd_generate,
-    "genbg":    cmd_genbg,
-    "produce":  cmd_produce,
-    "report":   cmd_report,
-    "schedule": cmd_schedule,
-    "health":   cmd_health,
-    "scrape":   cmd_scrape,
+    "setup":        cmd_setup,
+    "crawl":        cmd_crawl,
+    "generate":     cmd_generate,
+    "genbg":        cmd_genbg,
+    "produce":      cmd_produce,
+    "report":       cmd_report,
+    "schedule":     cmd_schedule,
+    "health":       cmd_health,
+    "scrape":       cmd_scrape,
+    "fetch-assets": cmd_fetch_assets,
 }
 
 

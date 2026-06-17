@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 
 from src.core import database
 from src.core.llm import call_llm
+from src.engines.assets_fetcher import OBJECT_REGISTRY
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -197,8 +198,148 @@ def _comment_hook_rule(stage: int) -> str:
             "（如“评论区说说你和爸妈年轻时的故事”），绝对不要出现任何引流/主页/做法/教程等字样。")
 
 
+# ============================================================
+# 内容模式：photo（老照片家庭情感，默认/第二阶段变现线）
+#           object（老物件年代记忆，第一阶段规模化养号线）
+# ============================================================
+def _content_mode() -> str:
+    return os.getenv("CONTENT_MODE", "photo").strip().lower()
+
+
+_OBJECT_SERIES = ["《老物件里的年代》", "《那些年的老物件》", "《年代记忆》"]
+
+_OBJECT_SCRIPT_PROMPT = """
+你是专注微信视频号「老物件 · 年代记忆」赛道的顶级操盘手。
+核心目标:让中老年用户看到一件老物件就被勾起集体回忆,【想转给家人/在评论区报年代】。
+
+本期老物件:【{object_cn}】（{era}；细节:{sensory}）
+人设旁白:固定一位{narrator_gender}声中老年讲述者,温和、有阅历、说大白话。
+当前日期:{current_date}
+
+【真实性红线·非常重要】
+- 这是【集体回忆/年代讲述】,不是某个真人的真实经历。一律用"那个年代/家家户户/咱们小时候"这种**集体视角**,
+  绝对不要编造"这是我妈的/我家的"具体真人真事(会涉编造+不可信)。
+- 画面用的是【真实老物件图】,所以文案只讲物件和年代,不要描述具体人脸。
+
+【限流红线】禁止 医院/疾病/卖惨/独居/去世,禁止"趁还在/子欲养而亲不待"等死亡紧迫感措辞。基调温暖、怀旧、带点会心一笑。
+
+【硬性长度】口播正文 60~90 字(约 25~35 秒),\\n 断句,每行≤10 字,8~12 行。
+
+【前 3 秒钩子】第一句必须直接点出这件老物件 + 一个具体细节,瞬间唤起"我家也有过"。
+例:"这个搪瓷缸\\n你家肯定也有过"。禁止抽象说理开头。
+
+【结尾钩子——动态挑 1~2 个,别全塞,雷同会被判模板号限流】
+A. 互动钩子(最易接话):"你家还有这个吗?评论区报个年代" / "你是哪年的?报一下"。
+B. 追更钩子:关联系列名,给"不关注会错过"的理由:"老物件我整理了一整套,关注别错过下一件"。
+C. 转发钩子:"家里有这物件的,转给孩子看看那个年代"。
+口播正文【绝对不要】出现"主页/私信/加微信/小程序/教程"等导流词。
+
+【评论区带头评论 comment_hook】(小号置顶示范,第一人称、真诚、≤40字)
+{comment_hook_rule}
+
+【封面钩子】3 版(cover_a/b/c),各 8 字内、两行 \\n,挑 3 种不同类型(年龄型/反问型/场景代入/对比/身份认同/结论前置/悬念/数字)。
+
+参考历史高互动样本(Few-shot):
+{few_shot_examples}
+
+输出严格 JSON(不含多余文字):
+{{
+    "learning_analysis": "(内部复盘)本条用了哪件物件勾对号入座、挑了哪个钩子、钩子是否克制",
+    "viral_text": "正文 60~90字,\\n 断句,集体回忆视角,结尾动态挑0~2个钩子(不要导流词)",
+    "image_prompt": "{object_cn}的真实物件特写描述(仅作备用,实际用真实图)",
+    "hooks_used": "本条实际用了哪些钩子(如:互动+转发 / 仅互动 / 无)",
+    "interaction_hook": "本条采用的互动提问(没用则空字符串)",
+    "follow_hook": "本条采用的追更话术(没用则空字符串)",
+    "cover_a": "类型X\\n封面",
+    "cover_b": "类型Y\\n封面",
+    "cover_c": "类型Z\\n封面",
+    "comment_hook": "小号带头评论示范文案"
+}}
+"""
+
+
+def _pick_object(identity: dict) -> dict:
+    """按集数轮换老物件，避免短期重复；无集数则随机。"""
+    episode = identity.get("episode")
+    if episode:
+        return OBJECT_REGISTRY[(episode - 1) % len(OBJECT_REGISTRY)]
+    return random.choice(OBJECT_REGISTRY)
+
+
+def _object_fallback_script(obj: dict, identity: dict, series_title: str) -> dict:
+    return {
+        "story_id": None,
+        "theme": "年代记忆",
+        "scene": obj["slug"],
+        "persona": "年代讲述人",
+        "narrator_gender": identity["narrator_gender"],
+        "series_title": series_title,
+        "learning_analysis": "兜底：集体回忆视角讲老物件，结尾互动+转发钩子（起号期不导流）。",
+        "viral_text": (
+            f"这个{obj['cn']}\n你家肯定也有过\n{obj['sensory']}\n那个年代\n"
+            f"家家都离不开它\n如今再看见\n眼眶就热了\n你家还留着吗\n评论区报个年代\n家里有的\n转给孩子看看"
+        ),
+        "image_prompt": f"{obj['cn']}的真实物件特写，年代感，写实",
+        "hooks_used": "互动+转发",
+        "interaction_hook": "你家还有这个吗？评论区报个年代",
+        "follow_hook": "",
+        "cover_a": f"{obj['cn']}\n你家还有吗",
+        "cover_b": "那个年代\n的老物件",
+        "cover_c": "暴露年龄\n系列",
+        "comment_hook": f"这个{obj['cn']}我太有印象了，你家是哪年的？评论区聊聊",
+    }
+
+
+def _generate_object_script(account: dict = None) -> Optional[dict]:
+    """老物件年代记忆模式：围绕一件真实老物件生成集体回忆口播，不依赖故事库。"""
+    persona = (account.get("persona") if account else None) or "年代讲述人"
+    identity = _account_identity(account, persona)
+    # 系列名走老物件系列
+    seed = sum(ord(c) for c in (account["account_id"] if account else "default"))
+    series_base = _OBJECT_SERIES[seed % len(_OBJECT_SERIES)]
+    series_title = f"{series_base} 第{identity['episode']}期" if identity.get("episode") else series_base
+
+    obj = _pick_object(identity)
+    from datetime import datetime
+    current_date = datetime.now().strftime("%Y-%m-%d %A")
+    stage = _monetize_stage()
+    logger.info(f"[物件模式] 老物件={obj['cn']}({obj['slug']}) 性别={identity['narrator_gender']} "
+                f"系列={series_title} MONETIZE_STAGE={stage}")
+
+    top_scripts = database.get_top_performing_scripts(limit=3)
+    few_shot = "".join(
+        f"爆款示例{i+1}：\n{s['viral_script']}\n\n" for i, s in enumerate(top_scripts)
+    ) or "暂无历史数据，请自由发挥。"
+
+    result = call_llm(_OBJECT_SCRIPT_PROMPT.format(
+        object_cn=obj["cn"], era=obj["era"], sensory=obj["sensory"],
+        narrator_gender=identity["narrator_gender"],
+        current_date=current_date,
+        comment_hook_rule=_comment_hook_rule(stage),
+        few_shot_examples=few_shot,
+    ), system="You are a helpful assistant that outputs valid JSON.",
+       temperature=0.85, prefer="script")
+
+    if not result:
+        logger.warning("[物件模式] 文案生成失败，使用兜底")
+        return _object_fallback_script(obj, identity, series_title)
+
+    result.update({
+        "story_id": None,
+        "theme": "年代记忆",
+        "scene": obj["slug"],          # 让 _pick_background 匹配 brolls/年代记忆/<slug>/
+        "persona": persona,
+        "narrator_gender": identity["narrator_gender"],
+        "series_title": series_title,
+    })
+    return result
+
+
 def generate_viral_script(account: dict = None) -> Optional[dict]:
-    """从故事库拉取故事并改写为视频脚本"""
+    """从故事库拉取故事并改写为视频脚本（photo 模式）；object 模式走老物件年代记忆。"""
+    if _content_mode() == "object":
+        return _generate_object_script(account)
+
     database.init_db()
 
     persona    = account["persona"]    if account else None
@@ -970,10 +1111,14 @@ async def main(account: dict = None):
     gender = script_data.get("narrator_gender", "male")
     await generate_audio(viral_text, audio_path, gender)
 
-    # AI 背景图生成
+    # 背景图：物件模式优先用真实老物件图(不调 AI，避免赝品)；photo 模式才走 AI 绘图
     image_prompt = script_data.get("image_prompt", "")
     bg_source = None
-    if image_prompt:
+    if _content_mode() == "object":
+        bg_source = _pick_background(theme, scene)
+        if not bg_source:
+            logger.warning(f"[物件模式] brolls/{theme}/{scene}/ 无真实素材，先跑 fetch-assets 下载；本条暂用兜底图")
+    elif image_prompt:
         bg_source = generate_ai_background(image_prompt)
     if not bg_source:
         bg_source = _pick_background(theme, scene) or _download_fallback_bg()
