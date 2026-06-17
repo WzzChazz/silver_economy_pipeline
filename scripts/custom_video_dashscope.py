@@ -7,11 +7,17 @@ import subprocess
 # Add project root to sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from dotenv import load_dotenv
 from src.engines.video_engine import create_video
+
+load_dotenv()
+
 def main():
     import dashscope
-    dashscope.api_key = "sk-0cebcb76fd6d45b293509bfd1790b6e1"
-    
+    dashscope.api_key = os.getenv("DASHSCOPE_API_KEY", "")
+    if not dashscope.api_key:
+        raise SystemExit("请在 .env 设置 DASHSCOPE_API_KEY")
+
     gen_text = """今天收拾旧衣柜
 翻出一个老钱包
 那是三十年前

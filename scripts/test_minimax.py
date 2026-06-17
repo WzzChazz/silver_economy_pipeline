@@ -1,8 +1,12 @@
 import requests
 import json
 import os
+from dotenv import load_dotenv
 
-api_key = "sk-api-Wycc8cvhG1NOf1xzk_4npN3xudP996hYwVI7Nt22JxYOSICp8EpewoTFpDu_htGmWZjOq-5AHcxn4miJUIRl7646CZXISyjGbKZRHNIeRjT-OYMwiIxBsZg"
+load_dotenv()
+api_key = os.getenv("MINIMAX_API_KEY", "")
+if not api_key:
+    raise SystemExit("请在 .env 设置 MINIMAX_API_KEY")
 url = "https://api.minimax.chat/v1/t2a_v2"
 headers = {
     "Authorization": f"Bearer {api_key}",
