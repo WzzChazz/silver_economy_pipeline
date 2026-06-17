@@ -1,7 +1,8 @@
 """
 main.py  —  银发矩阵系统主入口
 用法：
-  python main.py crawl        # 立即采集一次
+  python main.py crawl        # 立即采集一次（旧链路）
+  python main.py generate     # 生成唤起型素材入库（推荐，替代采集）
   python main.py produce      # 生成一条视频（所有活跃账号）
   python main.py report       # 输出选题效果报告
   python main.py schedule     # 启动完整调度器（采集 + 数据回传）
@@ -23,11 +24,11 @@ from src.core           import database
 def cmd_setup():
     """初始化数据库，并插入示例账号矩阵"""
     database.init_db()
-    # 示例：三个人设账号
+    # 示例：三个账号，各主攻一个新主题方向（正向人设，不踩独居/空巢红线）
     sample_accounts = [
-        ("account_001", "独居老人", "life"),
-        ("account_002", "退休教师", "children"),
-        ("account_003", "空巢老人", "partner"),
+        ("account_001", "恩爱老伴", "父母爱情"),
+        ("account_002", "怀旧老人", "年代记忆"),
+        ("account_003", "孝心儿女", "儿女孝心"),
     ]
     for acc_id, persona, theme in sample_accounts:
         database.upsert_account(acc_id, persona, theme)
@@ -39,6 +40,34 @@ def cmd_crawl():
     """立即触发一次多渠道采集"""
     from src.engines.crawler_engine import run_daily_crawl
     run_daily_crawl()
+
+
+def cmd_genbg():
+    """用 CogView 批量生成年代空镜背景素材库（存 brolls/{主题}/ 供 produce 复用）。
+
+    用法：python main.py genbg [每主题张数]
+    """
+    from src.engines.video_engine import generate_background_library
+    n = 3
+    if len(sys.argv) >= 3 and sys.argv[2].isdigit():
+        n = int(sys.argv[2])
+    saved = generate_background_library(n_per_theme=n)
+    print(f"✅ 背景素材库生成完成，共 {len(saved)} 张")
+
+
+def cmd_generate():
+    """生成唤起型素材入库（替代纯采集，零侵权 + 强对号入座）。
+
+    用法：python main.py generate [每主题条数]
+    """
+    from src.engines.story_engine import generate_evocative_stories
+    database.init_db()
+    n = 3
+    if len(sys.argv) >= 3 and sys.argv[2].isdigit():
+        n = int(sys.argv[2])
+    accepted = generate_evocative_stories(n_per_theme=n)
+    print(f"✅ 唤起型素材生成完成，入库候选 {len(accepted)} 条")
+    print(database.get_stats())
 
 
 def cmd_produce():
@@ -104,6 +133,8 @@ def cmd_scrape():
 COMMANDS = {
     "setup":    cmd_setup,
     "crawl":    cmd_crawl,
+    "generate": cmd_generate,
+    "genbg":    cmd_genbg,
     "produce":  cmd_produce,
     "report":   cmd_report,
     "schedule": cmd_schedule,
